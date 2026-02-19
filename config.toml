@@ -1,0 +1,61 @@
+# Hermitdroid — Configuration
+# OpenClaw-inspired autonomous Android AI agent
+
+[agent]
+name = "Hermitdroid"
+heartbeat_interval_secs = 30      # Fast tick (notification check, goals, commands)
+gateway_heartbeat_interval_secs = 1800  # Deep tick every 30 min (memory flush, curation)
+workspace_path = "./workspace"
+bootstrap_max_chars = 20000
+
+[brain]
+# Backend: "ollama", "openai_compatible", "llamacpp"
+backend = "ollama"
+model = "yeahdongcn/AutoGLM-Phone-9B"
+endpoint = "http://localhost:11434"
+# api_key = ""         # for openai_compatible backends
+vision_enabled = true
+max_tokens = 2048
+temperature = 0.7
+thinking = "medium"    # off, low, medium, high
+
+[perception]
+# "adb" — poll via ADB commands, no companion app needed
+# "websocket" — use the companion Android app for real-time data
+bridge_mode = "adb"
+# adb_device = ""                    # set if multiple devices: "192.168.1.X:5555"
+android_ws_address = "ws://192.168.1.100:9090"
+screen_capture_interval_secs = 0   # 0 = on demand only
+notifications_enabled = true
+accessibility_enabled = true
+# Apps whose notifications trigger immediate ticks
+priority_apps = ["whatsapp", "telegram", "gmail", "calendar"]
+
+[action]
+dry_run = false
+confirmation_timeout_secs = 60
+# Apps that are ALWAYS classified as RED regardless of action
+restricted_apps = ["banking", "finance", "pay", "wallet", "grab.driver"]
+
+[server]
+host = "0.0.0.0"
+port = 8420
+# auth_token = "your-secret-token"  # uncomment for production
+
+# === Cron Jobs (OpenClaw-style scheduled tasks) ===
+# [[cron]]
+# name = "morning-summary"
+# schedule = "0 8 * * *"           # Every day at 8 AM
+# message = "Good morning! Summarize my notifications and tell me about today's calendar."
+# enabled = true
+
+# [[cron]]
+# name = "evening-memory"
+# schedule = "0 22 * * *"          # Every day at 10 PM
+# message = "Review today's memory and curate important items into MEMORY.md."
+# enabled = true
+
+[hooks]
+# on_boot = "BOOT.md"             # Run this file's content on startup
+# on_session_new = ""              # Run on /new command
+# on_unlock = ""                   # Run when device unlocks
