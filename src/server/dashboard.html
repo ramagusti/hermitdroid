@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hermitdroid</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0a0f;
+  --surface: #12121a;
+  --surface2: #1a1a26;
+  --border: #2a2a3a;
+  --text: #e4e4ef;
+  --text2: #8888a0;
+  --accent: #6c5ce7;
+  --accent2: #a29bfe;
+  --green: #00b894;
+  --yellow: #fdcb6e;
+  --red: #e17055;
+  --blue: #74b9ff;
+  --radius: 12px;
+}
+
+* { margin:0; padding:0; box-sizing:border-box; }
+
+body {
+  font-family: 'DM Sans', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* --- Top Bar --- */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 24px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 100;
+  backdrop-filter: blur(20px);
+}
+.topbar-left { display: flex; align-items: center; gap: 12px; }
+.logo { font-size: 24px; }
+.brand { font-weight: 700; font-size: 18px; letter-spacing: -0.5px; }
+.status-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: 500;
+}
+.status-pill.running { background: rgba(0,184,148,.15); color: var(--green); }
+.status-pill.stopped { background: rgba(225,112,85,.15); color: var(--red); }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; }
+.status-pill.running .status-dot { background: var(--green); animation: pulse 2s infinite; }
+.status-pill.stopped .status-dot { background: var(--red); }
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.4; } }
+
+.topbar-right { display: flex; gap: 8px; }
+
+/* --- Tabs --- */
+.tabs {
+  display: flex; gap: 4px; padding: 12px 24px;
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+.tab {
+  padding: 8px 16px; border-radius: 8px; font-size: 14px; font-weight: 500;
+  color: var(--text2); cursor: pointer; border: none; background: none;
+  transition: all .2s; white-space: nowrap;
+}
+.tab:hover { color: var(--text); background: var(--surface2); }
+.tab.active { color: var(--accent2); background: rgba(108,92,231,.12); }
+
+/* --- Main content --- */
+.content { max-width: 900px; margin: 0 auto; padding: 24px; }
+
+.section { display: none; }
+.section.active { display: block; }
+
+/* --- Cards --- */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-bottom: 16px;
+}
+.card-title {
+  font-size: 14px; font-weight: 500; color: var(--text2);
+  text-transform: uppercase; letter-spacing: 1px;
+  margin-bottom: 16px;
+}
+
+/* --- Chat --- */
+.chat-container { display: flex; flex-direction: column; height: calc(100vh - 180px); }
+.chat-messages {
+  flex: 1; overflow-y: auto; padding: 16px 0;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.msg {
+  max-width: 80%; padding: 12px 16px;
+  border-radius: 16px; font-size: 14px; line-height: 1.5;
+  animation: msgIn .3s ease;
+}
+@keyframes msgIn { from { opacity:0; transform:translateY(8px); } }
+.msg.user {
+  align-self: flex-end; background: var(--accent);
+  color: white; border-bottom-right-radius: 4px;
+}
+.msg.agent {
+  align-self: flex-start; background: var(--surface2);
+  border: 1px solid var(--border); border-bottom-left-radius: 4px;
+}
+.msg.system {
+  align-self: center; background: none; color: var(--text2);
+  font-size: 12px; font-style: italic;
+}
+.msg .action-badge {
+  display: inline-block; padding: 2px 8px; border-radius: 4px;
+  font-size: 11px; font-family: 'JetBrains Mono', monospace;
+  margin: 4px 2px 0 0;
+}
+.action-badge.green { background: rgba(0,184,148,.15); color: var(--green); }
+.action-badge.yellow { background: rgba(253,203,110,.15); color: var(--yellow); }
+.action-badge.red { background: rgba(225,112,85,.15); color: var(--red); }
+
+.chat-input-row {
+  display: flex; gap: 8px; padding: 16px 0;
+  border-top: 1px solid var(--border);
+}
+.chat-input {
+  flex: 1; padding: 12px 16px; border-radius: 12px;
+  background: var(--surface2); border: 1px solid var(--border);
+  color: var(--text); font-size: 14px; font-family: inherit;
+  outline: none; transition: border-color .2s;
+}
+.chat-input:focus { border-color: var(--accent); }
+.chat-input::placeholder { color: var(--text2); }
+
+/* --- Buttons --- */
+.btn {
+  padding: 8px 16px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--surface2); color: var(--text); font-size: 13px;
+  font-weight: 500; cursor: pointer; font-family: inherit;
+  transition: all .2s; display: inline-flex; align-items: center; gap: 6px;
+}
+.btn:hover { background: var(--border); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: white; }
+.btn.primary:hover { background: var(--accent2); }
+.btn.danger { border-color: var(--red); color: var(--red); }
+.btn.danger:hover { background: rgba(225,112,85,.15); }
+.btn.sm { padding: 6px 12px; font-size: 12px; }
+
+/* --- Settings --- */
+.setting-group { margin-bottom: 24px; }
+.setting-group h3 {
+  font-size: 16px; font-weight: 600; margin-bottom: 12px;
+  display: flex; align-items: center; gap: 8px;
+}
+.setting-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 16px; background: var(--surface2);
+  border-radius: var(--radius); margin-bottom: 8px;
+}
+.setting-label { font-size: 14px; }
+.setting-label small { display: block; color: var(--text2); font-size: 12px; margin-top: 2px; }
+.setting-value {
+  display: flex; align-items: center; gap: 8px;
+}
+
+select, input[type="text"], input[type="number"], input[type="password"] {
+  padding: 8px 12px; border-radius: 8px;
+  background: var(--surface); border: 1px solid var(--border);
+  color: var(--text); font-size: 13px; font-family: inherit;
+  outline: none; min-width: 200px;
+}
+select:focus, input:focus { border-color: var(--accent); }
+
+/* Toggle switch */
+.toggle {
+  width: 44px; height: 24px; border-radius: 12px;
+  background: var(--border); cursor: pointer;
+  position: relative; transition: background .2s;
+}
+.toggle.on { background: var(--green); }
+.toggle::after {
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 20px; height: 20px; border-radius: 50%;
+  background: white; transition: transform .2s;
+}
+.toggle.on::after { transform: translateX(20px); }
+
+/* --- Activity Log --- */
+.log-entry {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 10px 0; border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.log-entry:last-child { border-bottom: none; }
+.log-time { color: var(--text2); font-family: 'JetBrains Mono', monospace; font-size: 11px; white-space: nowrap; }
+.log-type {
+  padding: 2px 8px; border-radius: 4px; font-size: 11px;
+  font-family: 'JetBrains Mono', monospace; white-space: nowrap;
+}
+
+/* --- Updates --- */
+.update-card {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px; background: var(--surface2); border-radius: var(--radius);
+}
+.update-info { display: flex; align-items: center; gap: 12px; }
+.update-icon { font-size: 32px; }
+
+/* --- Workspace editor --- */
+.ws-file-list {
+  display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px;
+}
+.ws-file-btn {
+  padding: 6px 14px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--surface2); color: var(--text2); font-size: 13px;
+  cursor: pointer; font-family: inherit; transition: all .2s;
+}
+.ws-file-btn:hover { color: var(--text); border-color: var(--text2); }
+.ws-file-btn.active { color: var(--accent2); border-color: var(--accent); background: rgba(108,92,231,.1); }
+
+.ws-editor {
+  width: 100%; min-height: 400px; padding: 16px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+  color: var(--text); font-family: 'JetBrains Mono', monospace;
+  font-size: 13px; line-height: 1.6; resize: vertical; outline: none;
+}
+.ws-editor:focus { border-color: var(--accent); }
+
+/* --- Responsive --- */
+@media (max-width: 600px) {
+  .content { padding: 16px; }
+  .setting-row { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .setting-value { width: 100%; }
+  .setting-value select, .setting-value input { width: 100%; min-width: 0; }
+  .msg { max-width: 95%; }
+}
+</style>
+</head>
+<body>
+
+<!-- Top Bar -->
+<div class="topbar">
+  <div class="topbar-left">
+    <span class="logo">🤖</span>
+    <span class="brand">Hermitdroid</span>
+    <span id="statusPill" class="status-pill running">
+      <span class="status-dot"></span>
+      <span id="statusText">Running</span>
+    </span>
+  </div>
+  <div class="topbar-right">
+    <button id="toggleBtn" class="btn sm" onclick="toggleAgent()">⏸ Pause</button>
+  </div>
+</div>
+
+<!-- Tabs -->
+<div class="tabs">
+  <button class="tab active" onclick="showTab('chat')">💬 Chat</button>
+  <button class="tab" onclick="showTab('activity')">📋 Activity</button>
+  <button class="tab" onclick="showTab('workspace')">📝 Workspace</button>
+  <button class="tab" onclick="showTab('settings')">⚙️ Settings</button>
+  <button class="tab" onclick="showTab('updates')">🔄 Updates</button>
+</div>
+
+<!-- Content -->
+<div class="content">
+
+  <!-- CHAT TAB -->
+  <div id="tab-chat" class="section active">
+    <div class="chat-container">
+      <div id="chatMessages" class="chat-messages">
+        <div class="msg system">Connected to Hermitdroid. Type a message or command.</div>
+      </div>
+      <div class="chat-input-row">
+        <input id="chatInput" class="chat-input" placeholder="Tell your agent what to do..." 
+               onkeydown="if(event.key==='Enter')sendChat()" autocomplete="off">
+        <button class="btn primary" onclick="sendChat()">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ACTIVITY TAB -->
+  <div id="tab-activity" class="section">
+    <div class="card">
+      <div class="card-title">Recent Actions</div>
+      <div id="activityLog">
+        <div style="color:var(--text2);font-size:14px">Loading...</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Pending Confirmations</div>
+      <div id="pendingActions">
+        <div style="color:var(--text2);font-size:14px">No pending actions.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- WORKSPACE TAB -->
+  <div id="tab-workspace" class="section">
+    <div class="card">
+      <div class="card-title">Workspace Files</div>
+      <div class="ws-file-list" id="wsFiles"></div>
+      <textarea id="wsEditor" class="ws-editor" placeholder="Select a file to edit..."></textarea>
+      <div style="margin-top:12px;display:flex;gap:8px">
+        <button class="btn primary" onclick="saveWorkspaceFile()">💾 Save</button>
+        <button class="btn" onclick="loadWorkspaceFile(currentWsFile)">↩ Revert</button>
+        <span id="wsSaveStatus" style="color:var(--green);font-size:13px;align-self:center"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- SETTINGS TAB -->
+  <div id="tab-settings" class="section">
+    <!-- Brain -->
+    <div class="setting-group">
+      <h3>🧠 AI Brain</h3>
+      <div class="setting-row">
+        <div class="setting-label">AI Provider<small>Which AI service powers your agent</small></div>
+        <div class="setting-value">
+          <select id="cfg-backend" onchange="onBackendChange()">
+            <option value="openai_compatible">Gemini / OpenAI API</option>
+            <option value="ollama">Ollama (local, free)</option>
+            <option value="codex_oauth">ChatGPT Subscription</option>
+          </select>
+        </div>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">Model<small>Which AI model to use</small></div>
+        <div class="setting-value">
+          <select id="cfg-model">
+            <option value="gemini-2.5-flash">Gemini 2.5 Flash (fast, free)</option>
+            <option value="gemini-2.5-pro">Gemini 2.5 Pro (smart, limited free)</option>
+            <option value="gemini-2.0-flash">Gemini 2.0 Flash (fastest)</option>
+            <option value="gpt-4o">GPT-4o</option>
+            <option value="gpt-4o-mini">GPT-4o Mini</option>
+            <option value="gpt-5.1-codex-mini">Codex Mini</option>
+            <option value="qwen2.5:3b">Qwen 2.5 3B (local)</option>
+          </select>
+        </div>
+      </div>
+      <div id="apiKeyRow" class="setting-row">
+        <div class="setting-label">API Key<small>Your API key for the AI service</small></div>
+        <div class="setting-value">
+          <input id="cfg-api-key" type="password" placeholder="Enter API key...">
+          <button class="btn sm" onclick="toggleApiKey()">👁</button>
+        </div>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">Vision (screenshots)<small>Let the AI see your phone screen</small></div>
+        <div class="setting-value">
+          <div id="cfg-vision" class="toggle on" onclick="toggleSetting(this)"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Behavior -->
+    <div class="setting-group">
+      <h3>🎯 Behavior</h3>
+      <div class="setting-row">
+        <div class="setting-label">Check-in frequency<small>How often the agent looks at your phone</small></div>
+        <div class="setting-value">
+          <select id="cfg-heartbeat">
+            <option value="10">Every 10 seconds (responsive)</option>
+            <option value="30">Every 30 seconds (balanced)</option>
+            <option value="60">Every minute (battery saver)</option>
+            <option value="120">Every 2 minutes (minimal)</option>
+          </select>
+        </div>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">Dry run mode<small>Log actions without actually doing them</small></div>
+        <div class="setting-value">
+          <div id="cfg-dryrun" class="toggle" onclick="toggleSetting(this)"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Priority Apps -->
+    <div class="setting-group">
+      <h3>📱 Priority Apps</h3>
+      <div class="setting-row">
+        <div class="setting-label">Apps that trigger immediate attention<small>Notifications from these apps wake the agent instantly</small></div>
+        <div class="setting-value">
+          <input id="cfg-priority-apps" type="text" placeholder="whatsapp, telegram, gmail" style="min-width:300px">
+        </div>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn primary" onclick="saveSettings()">💾 Save Settings</button>
+      <span id="settingsSaveStatus" style="color:var(--green);font-size:13px;align-self:center"></span>
+    </div>
+  </div>
+
+  <!-- UPDATES TAB -->
+  <div id="tab-updates" class="section">
+    <div class="card">
+      <div class="card-title">Current Version</div>
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <div style="font-size:24px;font-weight:700" id="currentVersion">v0.1.0</div>
+          <div style="color:var(--text2);font-size:13px;margin-top:4px" id="currentBranch">main</div>
+        </div>
+        <button class="btn primary" onclick="checkUpdates()">🔄 Check for Updates</button>
+      </div>
+    </div>
+    <div id="updateResult" style="display:none">
+      <div class="card">
+        <div id="updateContent"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Manual Commands</div>
+      <div style="color:var(--text2);font-size:13px;line-height:1.8;font-family:'JetBrains Mono',monospace">
+        cd ~/.hermitdroid && git pull && make<br>
+        hermitdroid doctor<br>
+        hermitdroid status
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const API = '';  // relative URL — same host
+let ws = null;
+let currentWsFile = 'SOUL.md';
+const wsFiles = ['SOUL.md','TOOLS.md','IDENTITY.md','HEARTBEAT.md','AGENTS.md','USER.md','GOALS.md','MEMORY.md'];
+
+// --- Tab switching ---
+function showTab(name) {
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  event.target.classList.add('active');
+  if (name === 'activity') loadActivity();
+  if (name === 'settings') loadSettings();
+  if (name === 'workspace') initWorkspace();
+}
+
+// --- WebSocket ---
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws/user`);
+  ws.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      if (data.type === 'agent_message') {
+        addMsg('agent', data.message);
+      } else if (data.type === 'action') {
+        const cls = (data.classification||'green').toLowerCase();
+        addMsg('agent', `<span class="action-badge ${cls}">${data.classification}</span> ${data.action}: ${data.result}`);
+      }
+    } catch(err) {}
+  };
+  ws.onclose = () => {
+    addMsg('system', 'Disconnected. Reconnecting...');
+    setTimeout(connectWS, 3000);
+  };
+  ws.onerror = () => {};
+}
+
+// --- Chat ---
+function addMsg(type, text) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + type;
+  el.innerHTML = text;
+  const container = document.getElementById('chatMessages');
+  container.appendChild(el);
+  container.scrollTop = container.scrollHeight;
+}
+
+async function sendChat() {
+  const input = document.getElementById('chatInput');
+  const msg = input.value.trim();
+  if (!msg) return;
+  input.value = '';
+  addMsg('user', msg);
+
+  // Try WebSocket first
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(msg);
+  }
+  // Also send via HTTP
+  try {
+    const r = await fetch(API+'/chat', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({message: msg})
+    });
+    const data = await r.json();
+    if (data.ok && data.data && data.data !== 'queued') {
+      addMsg('agent', data.data);
+    }
+  } catch(e) { addMsg('system', 'Failed to send: '+e.message); }
+}
+
+// --- Status polling ---
+async function pollStatus() {
+  try {
+    const r = await fetch(API+'/status');
+    const d = await r.json();
+    if (d.ok) {
+      const running = d.data.running;
+      const pill = document.getElementById('statusPill');
+      const text = document.getElementById('statusText');
+      const btn = document.getElementById('toggleBtn');
+      pill.className = 'status-pill ' + (running ? 'running' : 'stopped');
+      text.textContent = running ? 'Running' : 'Stopped';
+      btn.innerHTML = running ? '⏸ Pause' : '▶ Start';
+      btn.className = running ? 'btn sm' : 'btn sm primary';
+    }
+  } catch(e) {
+    document.getElementById('statusText').textContent = 'Offline';
+    document.getElementById('statusPill').className = 'status-pill stopped';
+  }
+}
+
+async function toggleAgent() {
+  const pill = document.getElementById('statusPill');
+  const isRunning = pill.classList.contains('running');
+  await fetch(API + (isRunning ? '/stop' : '/start'), {method:'POST'});
+  pollStatus();
+}
+
+// --- Activity log ---
+async function loadActivity() {
+  try {
+    const r = await fetch(API+'/actions/log');
+    const d = await r.json();
+    const container = document.getElementById('activityLog');
+    if (d.ok && d.data && d.data.length > 0) {
+      container.innerHTML = d.data.slice(-50).reverse().map(a => {
+        const time = new Date(a.timestamp).toLocaleTimeString();
+        const cls = a.classification.toLowerCase().replace('-auto','').replace('-confirmed','');
+        const clsColor = cls === 'red' ? 'var(--red)' : cls === 'yellow' ? 'var(--yellow)' : 'var(--green)';
+        return `<div class="log-entry">
+          <span class="log-time">${time}</span>
+          <span class="log-type" style="background:${clsColor}22;color:${clsColor}">${a.classification}</span>
+          <span>${a.action_type} → ${a.result.substring(0,80)}</span>
+        </div>`;
+      }).join('');
+    } else {
+      container.innerHTML = '<div style="color:var(--text2);font-size:14px">No actions yet.</div>';
+    }
+
+    // Pending
+    const r2 = await fetch(API+'/pending');
+    const d2 = await r2.json();
+    const pContainer = document.getElementById('pendingActions');
+    if (d2.ok && d2.data && d2.data.length > 0) {
+      pContainer.innerHTML = d2.data.map(p => `
+        <div class="log-entry" style="align-items:center">
+          <span class="log-type" style="background:var(--red)22;color:var(--red)">RED</span>
+          <span style="flex:1">${p.action.action_type}: ${p.action.reason}</span>
+          <button class="btn sm primary" onclick="confirmAction('${p.action_id}',true)">✅ Approve</button>
+          <button class="btn sm danger" onclick="confirmAction('${p.action_id}',false)">❌ Deny</button>
+        </div>
+      `).join('');
+    } else {
+      pContainer.innerHTML = '<div style="color:var(--text2);font-size:14px">No pending actions.</div>';
+    }
+  } catch(e) {}
+}
+
+async function confirmAction(id, approved) {
+  await fetch(API+'/confirm/'+id, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({approved})
+  });
+  loadActivity();
+}
+
+// --- Workspace ---
+function initWorkspace() {
+  const container = document.getElementById('wsFiles');
+  container.innerHTML = wsFiles.map(f =>
+    `<button class="ws-file-btn ${f===currentWsFile?'active':''}" onclick="loadWorkspaceFile('${f}')">${f}</button>`
+  ).join('');
+  loadWorkspaceFile(currentWsFile);
+}
+
+async function loadWorkspaceFile(filename) {
+  currentWsFile = filename;
+  document.querySelectorAll('.ws-file-btn').forEach(b => {
+    b.classList.toggle('active', b.textContent === filename);
+  });
+  document.getElementById('wsSaveStatus').textContent = '';
+  const editor = document.getElementById('wsEditor');
+  editor.value = 'Loading...';
+  try {
+    const r = await fetch(API+'/workspace/'+encodeURIComponent(filename));
+    if (!r.ok) {
+      editor.value = '(File not found or empty — start typing to create it)';
+      return;
+    }
+    const d = await r.json();
+    if (d.ok && d.data !== null && d.data !== undefined) {
+      editor.value = typeof d.data === 'string' ? d.data : JSON.stringify(d.data, null, 2);
+    } else {
+      editor.value = d.error || '(Empty file — start typing to add content)';
+    }
+  } catch(e) {
+    editor.value = '(Could not connect to agent — is it running?)';
+  }
+}
+
+async function saveWorkspaceFile() {
+  const content = document.getElementById('wsEditor').value;
+  try {
+    await fetch(API+'/workspace/'+currentWsFile, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({content})
+    });
+    document.getElementById('wsSaveStatus').textContent = '✓ Saved!';
+    setTimeout(() => document.getElementById('wsSaveStatus').textContent = '', 2000);
+  } catch(e) {
+    document.getElementById('wsSaveStatus').textContent = '✗ Error saving';
+  }
+}
+
+// --- Settings ---
+async function loadSettings() {
+  try {
+    const r = await fetch(API+'/config');
+    const d = await r.json();
+    if (!d.ok) return;
+    const c = d.data;
+    document.getElementById('cfg-backend').value = c.brain?.backend || 'openai_compatible';
+    document.getElementById('cfg-model').value = c.brain?.model || 'gemini-2.5-flash';
+    document.getElementById('cfg-api-key').value = c.brain?.api_key || '';
+    document.getElementById('cfg-heartbeat').value = String(c.agent?.heartbeat_interval_secs || 30);
+    setToggle('cfg-vision', c.brain?.vision_enabled !== false);
+    setToggle('cfg-dryrun', c.action?.dry_run === true);
+    document.getElementById('cfg-priority-apps').value = (c.perception?.priority_apps || []).join(', ');
+    onBackendChange();
+  } catch(e) {}
+}
+
+async function saveSettings() {
+  const config = {
+    brain: {
+      backend: document.getElementById('cfg-backend').value,
+      model: document.getElementById('cfg-model').value,
+      api_key: document.getElementById('cfg-api-key').value,
+      vision_enabled: document.getElementById('cfg-vision').classList.contains('on'),
+    },
+    agent: {
+      heartbeat_interval_secs: parseInt(document.getElementById('cfg-heartbeat').value),
+    },
+    action: {
+      dry_run: document.getElementById('cfg-dryrun').classList.contains('on'),
+    },
+    perception: {
+      priority_apps: document.getElementById('cfg-priority-apps').value.split(',').map(s=>s.trim()).filter(Boolean),
+    }
+  };
+  try {
+    await fetch(API+'/config', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(config)
+    });
+    document.getElementById('settingsSaveStatus').textContent = '✓ Saved! Restart agent to apply.';
+    setTimeout(() => document.getElementById('settingsSaveStatus').textContent = '', 4000);
+  } catch(e) {
+    document.getElementById('settingsSaveStatus').textContent = '✗ Error';
+  }
+}
+
+function onBackendChange() {
+  const v = document.getElementById('cfg-backend').value;
+  document.getElementById('apiKeyRow').style.display = v === 'codex_oauth' ? 'none' : 'flex';
+}
+
+function toggleSetting(el) { el.classList.toggle('on'); }
+function setToggle(id, val) {
+  const el = document.getElementById(id);
+  if (val) el.classList.add('on'); else el.classList.remove('on');
+}
+function toggleApiKey() {
+  const el = document.getElementById('cfg-api-key');
+  el.type = el.type === 'password' ? 'text' : 'password';
+}
+
+// --- Updates ---
+async function checkUpdates() {
+  const container = document.getElementById('updateResult');
+  const content = document.getElementById('updateContent');
+  container.style.display = 'block';
+  content.innerHTML = '<div style="color:var(--text2)">Checking for updates...</div>';
+  try {
+    const r = await fetch(API+'/update/check');
+    const d = await r.json();
+    if (d.ok && d.data) {
+      if (d.data.up_to_date) {
+        content.innerHTML = '<div style="color:var(--green);font-size:16px;font-weight:600">✅ You\'re up to date!</div>';
+      } else {
+        content.innerHTML = `
+          <div style="margin-bottom:12px">
+            <div style="font-size:16px;font-weight:600;color:var(--yellow)">🆕 Update available</div>
+            <div style="color:var(--text2);font-size:13px;margin-top:4px">${d.data.commits_behind || '?'} commits behind</div>
+            ${d.data.latest_message ? '<div style="margin-top:8px;font-size:13px">'+d.data.latest_message+'</div>' : ''}
+          </div>
+          <button class="btn primary" onclick="installUpdate()">📥 Install Update</button>
+        `;
+      }
+    }
+  } catch(e) {
+    content.innerHTML = '<div style="color:var(--red)">Could not check for updates.</div>';
+  }
+}
+
+async function installUpdate() {
+  const content = document.getElementById('updateContent');
+  content.innerHTML = '<div style="color:var(--text2)">Updating... This may take a minute.</div>';
+  try {
+    const r = await fetch(API+'/update/install', {method:'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      content.innerHTML = '<div style="color:var(--green);font-size:16px;font-weight:600">✅ Updated! Restart the agent to use the new version.</div>';
+    } else {
+      content.innerHTML = '<div style="color:var(--red)">Update failed: '+(d.error||'unknown')+'</div>';
+    }
+  } catch(e) {
+    content.innerHTML = '<div style="color:var(--red)">Update failed: '+e.message+'</div>';
+  }
+}
+
+// --- Init ---
+connectWS();
+pollStatus();
+setInterval(pollStatus, 5000);
+</script>
+</body>
+</html>

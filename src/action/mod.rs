@@ -25,6 +25,8 @@ pub struct ActionExecutor {
     dry_run: bool,
     adb_device: Option<String>,
     restricted_apps: Vec<String>,
+    /// If true, RED actions execute immediately (user opted in via SOUL.md boundaries)
+    auto_confirm_red: bool,
     pending: Arc<Mutex<Vec<PendingConfirmation>>>,
     outgoing: Arc<Mutex<Vec<DeviceAction>>>,
     action_log: Arc<Mutex<Vec<ActionLogEntry>>>,
@@ -44,6 +46,7 @@ impl ActionExecutor {
             dry_run,
             adb_device,
             restricted_apps,
+            auto_confirm_red: true, // Default: auto-confirm per SOUL.md boundary rules
             pending: Arc::new(Mutex::new(Vec::new())),
             outgoing: Arc::new(Mutex::new(Vec::new())),
             action_log: Arc::new(Mutex::new(Vec::new())),
@@ -61,6 +64,32 @@ impl ActionExecutor {
 
         match classification.as_str() {
             "RED" => {
+                // Check if this involves a restricted app → always queue
+                if let Some(pkg) = action.params.get("package").and_then(|v| v.as_str()) {
+                    if self.restricted_apps.iter().any(|a| pkg.contains(a)) {
+                        self.pending.lock().await.push(PendingConfirmation {
+                            action_id: id.clone(),
+                            action: action.clone(),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            confirmed: None,
+                        });
+                        info!("[RED-RESTRICTED] Queued for confirmation: {} ({})", action.action_type, id);
+                        return Ok(format!("PENDING:{}", id));
+                    }
+                }
+
+                // Auto-confirm if enabled (SOUL.md says "send messages without confirmation")
+                if self.auto_confirm_red {
+                    info!("[RED-AUTO] {}: {}", action.action_type, action.reason);
+                    if self.dry_run {
+                        return self.log_dry_run(action, &classification).await;
+                    }
+                    let result = self.do_action(action, &id).await?;
+                    self.log_action(action, "RED-AUTO", &result).await;
+                    return Ok(result);
+                }
+
+                // Otherwise queue for manual confirmation
                 self.pending.lock().await.push(PendingConfirmation {
                     action_id: id.clone(),
                     action: action.clone(),
@@ -146,43 +175,131 @@ impl ActionExecutor {
     async fn do_action(&self, action: &AgentAction, id: &str) -> anyhow::Result<String> {
         let p = &action.params;
         match action.action_type.as_str() {
-            "tap" => self.adb(&["shell", "input", "tap",
-                &p["x"].as_f64().unwrap_or(0.0).to_string(),
-                &p["y"].as_f64().unwrap_or(0.0).to_string()]),
+            // --- Screen interactions ---
+            "tap" => {
+                let result = self.adb(&["shell", "input", "tap",
+                    &p["x"].as_f64().unwrap_or(0.0).to_string(),
+                    &p["y"].as_f64().unwrap_or(0.0).to_string()]);
+                // Auto-settle: wait 500ms after every tap for UI animations/keyboard
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                result
+            }
+
+            "long_press" => {
+                let x = p["x"].as_f64().unwrap_or(0.0);
+                let y = p["y"].as_f64().unwrap_or(0.0);
+                let ms = p["ms"].as_u64().unwrap_or(1000);
+                // Long press = swipe from same point to same point with duration
+                self.adb(&["shell", "input", "swipe",
+                    &x.to_string(), &y.to_string(),
+                    &x.to_string(), &y.to_string(),
+                    &ms.to_string()])
+            }
+
             "swipe" => self.adb(&["shell", "input", "swipe",
                 &p["x1"].as_f64().unwrap_or(0.0).to_string(),
                 &p["y1"].as_f64().unwrap_or(0.0).to_string(),
                 &p["x2"].as_f64().unwrap_or(0.0).to_string(),
                 &p["y2"].as_f64().unwrap_or(0.0).to_string(),
-                &p["duration_ms"].as_u64().unwrap_or(300).to_string()]),
+                &p.get("ms").or(p.get("duration_ms"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(300).to_string()]),
+
+            // --- Text input ---
+            // Auto-settle: wait 300ms before typing to let keyboard appear
             "type_text" => {
+                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 let text = p["text"].as_str().unwrap_or("");
-                let escaped = text.replace(' ', "%s");
-                self.adb(&["shell", "input", "text", &escaped])
+                if text.is_empty() {
+                    return Ok("type_text: empty text, skipped".into());
+                }
+
+                // Try ADB input text first (works for simple alphanumeric)
+                let escaped = text
+                    .replace('\\', "\\\\")
+                    .replace(' ', "%s")
+                    .replace('&', "\\&")
+                    .replace('<', "\\<")
+                    .replace('>', "\\>")
+                    .replace('|', "\\|")
+                    .replace(';', "\\;")
+                    .replace('(', "\\(")
+                    .replace(')', "\\)")
+                    .replace('\'', "\\'")
+                    .replace('"', "\\\"")
+                    .replace('$', "\\$")
+                    .replace('`', "\\`");
+
+                match self.adb(&["shell", "input", "text", &escaped]) {
+                    Ok(result) => Ok(result),
+                    Err(_) => {
+                        // Fallback: use ADB broadcast to type via clipboard
+                        warn!("input text failed, trying broadcast fallback for: {}", text);
+                        // Set clipboard and paste
+                        let _ = self.adb(&["shell", "input", "keyevent", "KEYCODE_MOVE_HOME"]);
+                        // Use am broadcast with the text
+                        self.adb(&["shell", "am", "broadcast", "-a",
+                            "ADB_INPUT_TEXT", "--es", "msg", text])
+                    }
+                }
             }
+
+            // --- Key events ---
             "press_key" => {
                 let key = p["key"].as_str().unwrap_or("KEYCODE_HOME");
                 self.adb(&["shell", "input", "keyevent", key])
             }
+
+            // --- App management ---
             "launch_app" => {
                 let pkg = p["package"].as_str().unwrap_or("");
-                self.adb(&["shell", "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"])
+                let result = self.adb(&["shell", "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"]);
+                // Auto-settle: wait 1500ms for app to fully launch
+                tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+                result
             }
-            "open_notifications" => self.adb(&["shell", "cmd", "statusbar", "expand-notifications"]),
-            "go_home" => self.adb(&["shell", "input", "keyevent", "KEYCODE_HOME"]),
-            "go_back" => self.adb(&["shell", "input", "keyevent", "KEYCODE_BACK"]),
-            "scroll_down" => self.adb(&["shell", "input", "swipe", "540", "1500", "540", "500", "300"]),
-            "scroll_up" => self.adb(&["shell", "input", "swipe", "540", "500", "540", "1500", "300"]),
+
+            // --- Navigation (accept both naming conventions) ---
+            "home" | "go_home" =>
+                self.adb(&["shell", "input", "keyevent", "KEYCODE_HOME"]),
+
+            "back" | "go_back" =>
+                self.adb(&["shell", "input", "keyevent", "KEYCODE_BACK"]),
+
+            "recents" =>
+                self.adb(&["shell", "input", "keyevent", "KEYCODE_APP_SWITCH"]),
+
+            "open_notifications" =>
+                self.adb(&["shell", "cmd", "statusbar", "expand-notifications"]),
+
+            "scroll_down" =>
+                self.adb(&["shell", "input", "swipe", "540", "1500", "540", "500", "300"]),
+
+            "scroll_up" =>
+                self.adb(&["shell", "input", "swipe", "540", "500", "540", "1500", "300"]),
+
+            // --- Timing ---
             "wait" => {
                 let ms = p["ms"].as_u64().unwrap_or(1000);
                 tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
                 Ok(format!("waited {}ms", ms))
             }
+
+            // --- Screenshot ---
+            "screenshot" => {
+                self.adb(&["shell", "screencap", "-p", "/sdcard/hermitdroid_screenshot.png"])?;
+                self.adb(&["pull", "/sdcard/hermitdroid_screenshot.png", "/tmp/hermitdroid_screenshot.png"])
+            }
+
+            // --- Notifications to user (accept both "text" and "message" params) ---
             "notify_user" => {
-                let msg = p["message"].as_str().unwrap_or("");
+                let msg = p.get("text").or(p.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 info!("[NOTIFY_USER] {}", msg);
                 Ok(format!("notified: {}", msg))
             }
+
             _ => {
                 // Send to companion app as generic action
                 self.outgoing.lock().await.push(DeviceAction {
@@ -201,11 +318,25 @@ impl ActionExecutor {
             cmd.args(["-s", dev]);
         }
         cmd.args(args);
+
         let out = cmd.output()?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+
         if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            if !stdout.is_empty() {
+                Ok(stdout)
+            } else {
+                Ok("ok".into())
+            }
         } else {
-            anyhow::bail!("adb error: {}", String::from_utf8_lossy(&out.stderr))
+            // Log stderr but still return stdout if we got some output
+            if !stdout.is_empty() {
+                warn!("adb warning: {}", stderr);
+                Ok(stdout)
+            } else {
+                anyhow::bail!("adb error: {}", if stderr.is_empty() { "unknown error".into() } else { stderr })
+            }
         }
     }
 }

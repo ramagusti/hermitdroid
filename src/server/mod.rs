@@ -4,8 +4,7 @@ use crate::session::SessionManager;
 use crate::soul::Workspace;
 use axum::{
     extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, State},
-    http::StatusCode,
-    response::IntoResponse,
+    response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
@@ -13,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tower_http::cors::CorsLayer;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -26,18 +25,26 @@ pub struct AppState {
 }
 
 #[derive(Serialize)]
-struct R<T: Serialize> { ok: bool, data: Option<T>, error: Option<String> }
-impl<T: Serialize> R<T> {
-    fn ok(d: T) -> Json<R<T>> { Json(R { ok: true, data: Some(d), error: None }) }
+struct R { ok: bool, data: Option<serde_json::Value>, error: Option<String> }
+impl R {
+    fn ok<T: Serialize>(d: T) -> Json<R> { Json(R { ok: true, data: Some(serde_json::to_value(d).unwrap_or_default()), error: None }) }
+    fn err(m: &str) -> Json<R> { Json(R { ok: false, data: None, error: Some(m.into()) }) }
 }
-fn err(m: &str) -> Json<R<()>> { Json(R { ok: false, data: None, error: Some(m.into()) }) }
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        // Dashboard (root)
+        .route("/", get(dashboard))
         // Agent control
         .route("/status", get(status))
         .route("/start", post(start))
         .route("/stop", post(stop))
+        // Config (settings UI)
+        .route("/config", get(get_config))
+        .route("/config", post(set_config))
+        // Updates
+        .route("/update/check", get(check_update))
+        .route("/update/install", post(install_update))
         // Workspace files (OpenClaw-style)
         .route("/workspace/{filename}", get(read_workspace_file))
         .route("/workspace/{filename}", post(write_workspace_file))
@@ -66,6 +73,14 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+// ---- Dashboard ----
+
+async fn dashboard() -> Html<&'static str> {
+    Html(include_str!("dashboard.html"))
+}
+
+// ---- Status ----
+
 async fn status(State(s): State<AppState>) -> impl IntoResponse {
     let running = *s.running.lock().await;
     let pending = s.executor.pending().lock().await.len();
@@ -80,6 +95,200 @@ async fn status(State(s): State<AppState>) -> impl IntoResponse {
 async fn start(State(s): State<AppState>) -> impl IntoResponse { *s.running.lock().await = true; R::ok("started") }
 async fn stop(State(s): State<AppState>) -> impl IntoResponse { *s.running.lock().await = false; R::ok("stopped") }
 
+// ---- Config API (read/write config.toml via dashboard) ----
+
+async fn get_config() -> impl IntoResponse {
+    // Read config.toml and return as JSON
+    let config_path = find_config_path();
+    match std::fs::read_to_string(&config_path) {
+        Ok(content) => {
+            match content.parse::<toml::Table>() {
+                Ok(table) => R::ok(serde_json::to_value(table).unwrap_or_default()),
+                Err(e) => R::err(&format!("Config parse error: {}", e)),
+            }
+        }
+        Err(e) => R::err(&format!("Could not read config: {}", e)),
+    }
+}
+
+#[derive(Deserialize)]
+struct ConfigUpdate {
+    brain: Option<BrainUpdate>,
+    agent: Option<AgentUpdate>,
+    action: Option<ActionUpdate>,
+    perception: Option<PerceptionUpdate>,
+}
+
+#[derive(Deserialize)]
+struct BrainUpdate {
+    backend: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+    vision_enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct AgentUpdate {
+    heartbeat_interval_secs: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ActionUpdate {
+    dry_run: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct PerceptionUpdate {
+    priority_apps: Option<Vec<String>>,
+}
+
+async fn set_config(Json(update): Json<ConfigUpdate>) -> impl IntoResponse {
+    let config_path = find_config_path();
+
+    // Read existing config
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(e) => return R::err(&format!("Could not read config: {}", e)),
+    };
+
+    let mut table: toml::Table = match content.parse() {
+        Ok(t) => t,
+        Err(e) => return R::err(&format!("Config parse error: {}", e)),
+    };
+
+    // Apply updates
+    if let Some(brain) = update.brain {
+        let section = table.entry("brain").or_insert(toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(ref mut t) = section {
+            if let Some(v) = brain.backend { t.insert("backend".into(), toml::Value::String(v)); }
+            if let Some(v) = brain.model { t.insert("model".into(), toml::Value::String(v)); }
+            if let Some(v) = brain.api_key {
+                if !v.is_empty() {
+                    t.insert("api_key".into(), toml::Value::String(v));
+                }
+            }
+            if let Some(v) = brain.vision_enabled { t.insert("vision_enabled".into(), toml::Value::Boolean(v)); }
+        }
+    }
+
+    if let Some(agent) = update.agent {
+        let section = table.entry("agent").or_insert(toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(ref mut t) = section {
+            if let Some(v) = agent.heartbeat_interval_secs { t.insert("heartbeat_interval_secs".into(), toml::Value::Integer(v as i64)); }
+        }
+    }
+
+    if let Some(action) = update.action {
+        let section = table.entry("action").or_insert(toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(ref mut t) = section {
+            if let Some(v) = action.dry_run { t.insert("dry_run".into(), toml::Value::Boolean(v)); }
+        }
+    }
+
+    if let Some(perception) = update.perception {
+        let section = table.entry("perception").or_insert(toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(ref mut t) = section {
+            if let Some(apps) = perception.priority_apps {
+                let arr: Vec<toml::Value> = apps.into_iter().map(toml::Value::String).collect();
+                t.insert("priority_apps".into(), toml::Value::Array(arr));
+            }
+        }
+    }
+
+    // Write back
+    let new_content = toml::to_string_pretty(&table).unwrap_or_default();
+    match std::fs::write(&config_path, &new_content) {
+        Ok(()) => {
+            info!("Config updated via dashboard");
+            R::ok(serde_json::json!("saved"))
+        }
+        Err(e) => R::err(&format!("Could not write config: {}", e)),
+    }
+}
+
+/// Find config.toml — check current dir, then ~/.hermitdroid/
+fn find_config_path() -> String {
+    if std::path::Path::new("config.toml").exists() {
+        "config.toml".into()
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        format!("{}/.hermitdroid/config.toml", home)
+    }
+}
+
+// ---- Update API ----
+
+async fn check_update() -> impl IntoResponse {
+    // Git fetch and check if behind
+    let fetch = std::process::Command::new("git")
+        .args(["fetch", "origin", "--quiet"])
+        .output();
+
+    if fetch.is_err() {
+        return R::err("git not available");
+    }
+
+    // Check if behind
+    let status = std::process::Command::new("git")
+        .args(["rev-list", "HEAD..origin/main", "--count"])
+        .output();
+
+    let commits_behind = status.ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+
+    // Get latest commit message
+    let latest = std::process::Command::new("git")
+        .args(["log", "origin/main", "-1", "--pretty=format:%s"])
+        .output();
+
+    let latest_message = latest.ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+
+    R::ok(serde_json::json!({
+        "up_to_date": commits_behind == 0,
+        "commits_behind": commits_behind,
+        "latest_message": latest_message,
+    }))
+}
+
+async fn install_update() -> impl IntoResponse {
+    // git pull
+    let pull = std::process::Command::new("git")
+        .args(["pull", "--ff-only"])
+        .output();
+
+    match pull {
+        Ok(out) if out.status.success() => {
+            // Rebuild
+            let build = std::process::Command::new("cargo")
+                .args(["build", "--release"])
+                .output();
+
+            match build {
+                Ok(out) if out.status.success() => {
+                    info!("Update installed via dashboard");
+                    R::ok(serde_json::json!("updated"))
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    R::err(&format!("Build failed: {}", stderr))
+                }
+                Err(e) => R::err(&format!("Build error: {}", e)),
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            R::err(&format!("git pull failed: {}", stderr))
+        }
+        Err(e) => R::err(&format!("git error: {}", e)),
+    }
+}
+
+// ---- Workspace ----
+
 async fn read_workspace_file(State(s): State<AppState>, Path(f): Path<String>) -> impl IntoResponse {
     R::ok(s.workspace.read_file(&f))
 }
@@ -89,10 +298,12 @@ struct WriteBody { content: String }
 
 async fn write_workspace_file(State(s): State<AppState>, Path(f): Path<String>, Json(b): Json<WriteBody>) -> impl IntoResponse {
     match s.workspace.write_file(&f, &b.content) {
-        Ok(()) => R::ok("written"),
-        Err(e) => { err(&e.to_string()); R::ok("error") }
+        Ok(()) => R::ok("written".to_string()),
+        Err(e) => R::err(&e.to_string()),
     }
 }
+
+// ---- Memory ----
 
 async fn read_memory(State(s): State<AppState>) -> impl IntoResponse { R::ok(s.workspace.read_file("MEMORY.md")) }
 
@@ -105,8 +316,10 @@ struct MemoryBody { section: String, entry: String }
 
 async fn write_memory(State(s): State<AppState>, Json(b): Json<MemoryBody>) -> impl IntoResponse {
     s.workspace.append_long_term_memory(&b.section, &b.entry).ok();
-    R::ok("written")
+    R::ok("written".to_string())
 }
+
+// ---- Goals ----
 
 async fn read_goals(State(s): State<AppState>) -> impl IntoResponse { R::ok(s.workspace.read_file("GOALS.md")) }
 
@@ -122,8 +335,10 @@ async fn add_goal(State(s): State<AppState>, Json(b): Json<GoalBody>) -> impl In
 
 async fn complete_goal(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     s.workspace.complete_goal(&id).ok();
-    R::ok("completed")
+    R::ok("completed".to_string())
 }
+
+// ---- Sessions ----
 
 async fn list_sessions(State(s): State<AppState>) -> impl IntoResponse {
     R::ok(s.sessions.list_sessions().await)
@@ -135,8 +350,10 @@ async fn get_session(State(s): State<AppState>, Path(id): Path<String>) -> impl 
 
 async fn reset_session(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     s.sessions.reset_session(&id).await;
-    R::ok("reset")
+    R::ok("reset".to_string())
 }
+
+// ---- Actions ----
 
 async fn pending_actions(State(s): State<AppState>) -> impl IntoResponse {
     R::ok(s.executor.pending().lock().await.clone())
@@ -156,21 +373,21 @@ async fn action_log(State(s): State<AppState>) -> impl IntoResponse {
     R::ok(s.executor.action_log().lock().await.clone())
 }
 
+// ---- Chat ----
+
 #[derive(Deserialize)]
 struct ChatBody { message: String }
 
 async fn chat(State(s): State<AppState>, Json(b): Json<ChatBody>) -> impl IntoResponse {
-    // Handle slash commands (OpenClaw style)
     let msg = b.message.trim();
     if msg.starts_with('/') {
         let result = handle_slash_command(msg, &s).await;
         return R::ok(result);
     }
 
-    // Regular message → inject as user command for next tick
     s.perception.push_user_command(msg.to_string()).await;
     let _ = s.event_tx.send(serde_json::json!({"type":"user_command","text":msg}).to_string());
-    R::ok("queued")
+    R::ok("queued".to_string())
 }
 
 async fn handle_slash_command(cmd: &str, s: &AppState) -> String {
@@ -185,14 +402,8 @@ async fn handle_slash_command(cmd: &str, s: &AppState) -> String {
             s.sessions.reset_session("main").await;
             "Session reset.".into()
         }
-        "/stop" => {
-            *s.running.lock().await = false;
-            "Agent stopped.".into()
-        }
-        "/start" => {
-            *s.running.lock().await = true;
-            "Agent started.".into()
-        }
+        "/stop" => { *s.running.lock().await = false; "Agent stopped.".into() }
+        "/start" => { *s.running.lock().await = true; "Agent started.".into() }
         "/goal" => {
             if parts.len() > 1 {
                 match s.workspace.add_goal(parts[1], None) {
@@ -209,7 +420,10 @@ async fn handle_slash_command(cmd: &str, s: &AppState) -> String {
         }
         "/goals" => s.workspace.read_file("GOALS.md"),
         "/soul" => s.workspace.read_file("SOUL.md"),
-        _ => format!("Unknown command: {}", parts[0]),
+        "/help" => {
+            "/status — agent status\n/start — start agent\n/stop — stop agent\n/new — reset session\n/goal <text> — add goal\n/goals — list goals\n/memory — show memory\n/soul — show personality\n/help — this message".into()
+        }
+        _ => format!("Unknown command: {}. Type /help for available commands.", parts[0]),
     }
 }
 

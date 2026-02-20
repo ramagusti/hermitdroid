@@ -1,12 +1,40 @@
 use crate::config::BrainConfig;
 use crate::soul::BootstrapContext;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
+
+/// Codex OAuth token data read from ~/.codex/auth.json
+#[derive(Debug, Clone, Deserialize)]
+struct CodexAuthFile {
+    #[serde(rename = "OPENAI_API_KEY")]
+    openai_api_key: Option<String>,
+    tokens: Option<CodexTokens>,
+    last_refresh: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CodexTokens {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    id_token: Option<String>,
+    account_id: Option<String>,
+}
+
+/// Cached token with expiry tracking
+#[derive(Debug, Clone)]
+struct CachedCodexToken {
+    access_token: String,
+    loaded_at: std::time::Instant,
+}
 
 #[derive(Debug, Clone)]
 pub struct Brain {
     config: BrainConfig,
     client: reqwest::Client,
+    /// Cached Codex OAuth token (reloaded from disk periodically)
+    codex_token: Arc<RwLock<Option<CachedCodexToken>>>,
 }
 
 /// Structured response from the LLM
@@ -36,24 +64,116 @@ pub struct AgentAction {
 
 fn default_green() -> String { "GREEN".into() }
 
+/// Token cache duration — reload from disk every 7 minutes
+/// (Codex tokens refresh every ~8 minutes before expiry)
+const TOKEN_CACHE_SECS: u64 = 7 * 60;
+
 impl Brain {
     pub fn new(config: &BrainConfig) -> Self {
-        Self {
+        let brain = Self {
             config: config.clone(),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .unwrap_or_default(),
+            codex_token: Arc::new(RwLock::new(None)),
+        };
+
+        // Pre-load token if backend is codex_oauth
+        if config.backend == "codex_oauth" {
+            if let Some(_token) = Self::load_codex_token_from_disk(&config.codex_auth_path) {
+                info!("🔑 Codex OAuth: token loaded from {}", config.codex_auth_path.as_deref().unwrap_or("~/.codex/auth.json"));
+            } else {
+                warn!("⚠️  Codex OAuth: no token found. Run `codex login` or `npm i -g @openai/codex && codex login`");
+            }
         }
+
+        brain
     }
 
     pub fn model_name(&self) -> &str { &self.config.model }
+
+    /// Load the Codex access token from ~/.codex/auth.json (or custom path)
+    fn load_codex_token_from_disk(custom_path: &Option<String>) -> Option<String> {
+        let path = custom_path.clone().unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            format!("{}/.codex/auth.json", home)
+        });
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("⚠️  Could not read Codex auth file at {}: {}", path, e);
+                return None;
+            }
+        };
+
+        let auth: CodexAuthFile = match serde_json::from_str(&content) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("⚠️  Could not parse Codex auth file: {}", e);
+                return None;
+            }
+        };
+
+        // Prefer access_token from tokens object
+        if let Some(tokens) = &auth.tokens {
+            if let Some(ref token) = tokens.access_token {
+                if !token.is_empty() {
+                    debug!("Codex OAuth: using access_token from tokens object");
+                    return Some(token.clone());
+                }
+            }
+        }
+
+        // Fallback to OPENAI_API_KEY field
+        if let Some(ref key) = auth.openai_api_key {
+            if !key.is_empty() {
+                debug!("Codex OAuth: using OPENAI_API_KEY from auth file");
+                return Some(key.clone());
+            }
+        }
+
+        warn!("⚠️  Codex auth file exists but contains no usable token");
+        None
+    }
+
+    /// Get a valid Codex token, reloading from disk if cache is stale
+    async fn get_codex_token(&self) -> anyhow::Result<String> {
+        // Check cache first
+        {
+            let cached = self.codex_token.read().await;
+            if let Some(ref ct) = *cached {
+                if ct.loaded_at.elapsed().as_secs() < TOKEN_CACHE_SECS {
+                    return Ok(ct.access_token.clone());
+                }
+                debug!("Codex OAuth: token cache expired, reloading from disk");
+            }
+        }
+
+        // Reload from disk
+        let token = Self::load_codex_token_from_disk(&self.config.codex_auth_path)
+            .ok_or_else(|| anyhow::anyhow!(
+                "No Codex OAuth token found. Run `codex login` to authenticate with ChatGPT."
+            ))?;
+
+        // Update cache
+        {
+            let mut cached = self.codex_token.write().await;
+            *cached = Some(CachedCodexToken {
+                access_token: token.clone(),
+                loaded_at: std::time::Instant::now(),
+            });
+        }
+
+        info!("🔑 Codex OAuth: token refreshed from disk");
+        Ok(token)
+    }
 
     /// Build the full system prompt from workspace bootstrap context
     pub fn build_system_prompt(&self, ctx: &BootstrapContext) -> String {
         let mut prompt = String::new();
 
-        // Inject workspace files (same order as OpenClaw)
         if !ctx.soul.is_empty() {
             prompt.push_str(&format!("--- SOUL.md ---\n{}\n\n", ctx.soul));
         }
@@ -73,12 +193,10 @@ impl Brain {
             prompt.push_str(&format!("--- HEARTBEAT.md ---\n{}\n\n", ctx.heartbeat));
         }
 
-        // Bootstrap (first run only)
         if let Some(bootstrap) = &ctx.bootstrap {
             prompt.push_str(&format!("--- BOOTSTRAP.md (FIRST RUN) ---\n{}\n\n", bootstrap));
         }
 
-        // Skills (selectively injected)
         for skill in &ctx.skills {
             prompt.push_str(&format!("--- SKILL: {} ---\n{}\n\n", skill.name, skill.content));
         }
@@ -143,6 +261,9 @@ impl Brain {
             "openai_compatible" | "llamacpp" => {
                 self.openai_compat(system_prompt, user_prompt, image_base64).await
             }
+            "codex_oauth" => {
+                self.codex_oauth(system_prompt, user_prompt, image_base64).await
+            }
             other => anyhow::bail!("Unknown backend: {}", other),
         }
     }
@@ -151,7 +272,6 @@ impl Brain {
     pub fn parse_response(&self, raw: &str) -> AgentResponse {
         let trimmed = raw.trim();
 
-        // Check for HEARTBEAT_OK
         if trimmed.contains("HEARTBEAT_OK") {
             return AgentResponse {
                 reflection: Some("HEARTBEAT_OK".into()),
@@ -159,14 +279,37 @@ impl Brain {
             };
         }
 
-        // Try to extract JSON
-        if let Some(json_str) = extract_json(trimmed) {
-            if let Ok(resp) = serde_json::from_str::<AgentResponse>(&json_str) {
-                return resp;
+        // Sanitize common LLM output issues before JSON parsing
+        let sanitized = sanitize_llm_json(trimmed);
+
+        if let Some(json_str) = extract_json(&sanitized) {
+            match serde_json::from_str::<AgentResponse>(&json_str) {
+                Ok(resp) => return resp,
+                Err(e) => {
+                    warn!("JSON parse failed: {}. Attempting lenient parse...", e);
+                    // Try parsing as a generic Value first to diagnose
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                        // Manually extract fields for resilience
+                        return AgentResponse {
+                            actions: val.get("actions")
+                                .and_then(|a| serde_json::from_value(a.clone()).ok())
+                                .unwrap_or_default(),
+                            reflection: val.get("reflection")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            message: val.get("message")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            memory_write: val.get("memory_write")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                        };
+                    }
+                    warn!("Lenient parse also failed for: {}...", &json_str.chars().take(200).collect::<String>());
+                }
             }
         }
 
-        // Fallback
         AgentResponse {
             reflection: Some(trimmed.to_string()),
             message: Some(trimmed.to_string()),
@@ -245,12 +388,224 @@ impl Brain {
         let result: serde_json::Value = resp.json().await?;
         Ok(result["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string())
     }
+
+    /// Codex OAuth backend — uses the Responses API at chatgpt.com/backend-api/codex/responses
+    /// This endpoint REQUIRES stream:true and returns Server-Sent Events (SSE).
+    /// We collect the text deltas from the stream and return the full text.
+    /// Reference: https://simonwillison.net/2025/Nov/9/gpt-5-codex-mini/
+    async fn codex_oauth(
+        &self,
+        system: &str,
+        user: &str,
+        image: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let token = self.get_codex_token().await?;
+
+        let url = "https://chatgpt.com/backend-api/codex/responses";
+
+        // Build input array in OpenAI Responses API format
+        let mut input = vec![
+            serde_json::json!({
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": system
+                    }
+                ]
+            }),
+        ];
+
+        // User message — with optional image
+        if let Some(img) = image {
+            input.push(serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": user
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": format!("data:image/png;base64,{}", img)
+                    }
+                ]
+            }));
+        } else {
+            input.push(serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": user
+                    }
+                ]
+            }));
+        }
+
+        // Build the Responses API request body.
+        // stream MUST be true — the Codex backend rejects stream:false.
+        let body = serde_json::json!({
+            "model": self.config.model,
+            "instructions": system,
+            "input": input,
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "store": false,
+            "stream": true,
+        });
+
+        debug!("Codex OAuth: POST {} model={}", url, self.config.model);
+
+        let resp = self.client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
+            warn!("🔑 Codex OAuth: token rejected ({}). Clearing cache — will reload on next tick.", resp.status());
+            warn!("   If this persists, run `codex login` to re-authenticate.");
+            let mut cached = self.codex_token.write().await;
+            *cached = None;
+            anyhow::bail!("Codex OAuth: authentication failed ({}). Run `codex login` to refresh.", resp.status());
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Codex OAuth API error {} {}: {}", status.as_u16(), status, body_text);
+        }
+
+        // Parse the SSE stream to collect the full response text.
+        // The stream sends events like:
+        //   data: {"type":"response.output_text.delta","delta":"Hello"}
+        //   data: {"type":"response.output_text.delta","delta":" world"}
+        //   data: {"type":"response.completed","response":{"output_text":"Hello world",...}}
+        //   data: [DONE]
+        let full_body = resp.text().await?;
+        let mut collected_text = String::new();
+        let mut got_completed = false;
+
+        for line in full_body.lines() {
+            let line = line.trim();
+
+            // Skip empty lines and SSE comments
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+
+            // Extract the data payload from "data: {...}"
+            if let Some(data) = line.strip_prefix("data: ") {
+                let data = data.trim();
+
+                // Stream terminator
+                if data == "[DONE]" {
+                    break;
+                }
+
+                // Try to parse the JSON event
+                if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
+                    let event_type = event["type"].as_str().unwrap_or("");
+
+                    match event_type {
+                        // Text delta — accumulate the output
+                        "response.output_text.delta" => {
+                            if let Some(delta) = event["delta"].as_str() {
+                                collected_text.push_str(delta);
+                            }
+                        }
+                        // Response completed — try to grab output_text from the full response
+                        "response.completed" => {
+                            got_completed = true;
+                            if let Some(output_text) = event["response"]["output_text"].as_str() {
+                                if !output_text.is_empty() {
+                                    // Use the final complete text instead of deltas
+                                    collected_text = output_text.to_string();
+                                }
+                            }
+                        }
+                        // Ignore other events (response.created, response.in_progress,
+                        // response.output_item.added, response.content_part.added,
+                        // response.content_part.done, response.output_item.done, etc.)
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if collected_text.is_empty() && !got_completed {
+            warn!("Codex OAuth: stream ended but no text collected. Raw body length: {}", full_body.len());
+            // Log first 500 chars for debugging
+            let preview: String = full_body.chars().take(500).collect();
+            warn!("Codex OAuth: stream preview: {}", preview);
+            anyhow::bail!("Codex OAuth: received empty response from stream");
+        }
+
+        debug!("Codex OAuth: received {} chars", collected_text.len());
+        Ok(collected_text)
+    }
+}
+
+/// Sanitize common LLM JSON issues:
+/// - Curly/smart quotes → straight quotes
+/// - Em/en dashes → regular dashes
+/// - Trailing commas before } or ]
+/// - BOM and other invisible chars
+fn sanitize_llm_json(text: &str) -> String {
+    let mut s = text.to_string();
+
+    // Replace Unicode curly/smart quotes with ASCII equivalents
+    // These are the #1 cause of LLM JSON parse failures
+    s = s.replace('\u{201c}', "\\\"");  // left double curly quote "
+    s = s.replace('\u{201d}', "\\\"");  // right double curly quote "
+    s = s.replace('\u{2018}', "'");     // left single curly quote '
+    s = s.replace('\u{2019}', "'");     // right single curly quote '
+    s = s.replace('\u{00ab}', "\\\"");  // left guillemet «
+    s = s.replace('\u{00bb}', "\\\"");  // right guillemet »
+
+    // Replace em/en dashes with regular dashes
+    s = s.replace('\u{2014}', "-");     // em dash —
+    s = s.replace('\u{2013}', "-");     // en dash –
+
+    // Replace non-breaking spaces with regular spaces
+    s = s.replace('\u{00a0}', " ");     // NBSP
+    s = s.replace('\u{feff}', "");      // BOM / zero-width no-break space
+
+    // Remove trailing commas before } or ] (common LLM mistake)
+    // This is a simple regex-free approach
+    let bytes = s.as_bytes().to_vec();
+    let mut cleaned = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b',' {
+            // Look ahead past whitespace for } or ]
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\n' || bytes[j] == b'\r' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b'}' || bytes[j] == b']') {
+                // Skip the trailing comma
+                i += 1;
+                continue;
+            }
+        }
+        cleaned.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8(cleaned).unwrap_or(s)
 }
 
 fn extract_json(text: &str) -> Option<String> {
-    // Direct JSON
     if text.starts_with('{') {
-        // Find matching closing brace
         let mut depth = 0;
         for (i, ch) in text.chars().enumerate() {
             match ch {
@@ -265,7 +620,6 @@ fn extract_json(text: &str) -> Option<String> {
             }
         }
     }
-    // Code block
     if let Some(start) = text.find("```json") {
         let after = &text[start + 7..];
         if let Some(end) = after.find("```") {
@@ -281,7 +635,6 @@ fn extract_json(text: &str) -> Option<String> {
             }
         }
     }
-    // Find embedded JSON
     if let Some(start) = text.find('{') {
         let mut depth = 0;
         for (i, ch) in text[start..].chars().enumerate() {

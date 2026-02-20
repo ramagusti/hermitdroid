@@ -46,6 +46,9 @@ pub struct BrainConfig {
     /// Thinking level: off, low, medium, high
     #[serde(default = "default_thinking")]
     pub thinking: String,
+    /// Path to Codex OAuth auth.json (defaults to ~/.codex/auth.json)
+    #[serde(default)]
+    pub codex_auth_path: Option<String>,
 }
 
 fn default_max_tokens() -> u32 { 2048 }
