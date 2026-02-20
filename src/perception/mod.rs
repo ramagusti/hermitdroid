@@ -136,10 +136,10 @@ impl Perception {
             .unwrap_or(("unknown".into(), "unknown".into()));
 
         // 2. UI tree via uiautomator dump
-        let ui_tree = self
-            .adb(&["shell", "uiautomator", "dump", "/dev/tty"])
-            .ok()
-            .map(|xml| simplify_ui_xml(&xml));
+        // Method: dump to a file on device, then cat it back.
+        // The `/dev/tty` trick can produce garbled output with a prefix line.
+        // Using a temp file is more reliable.
+        let ui_tree = self.dump_ui_tree();
 
         let state = ScreenState {
             current_app: app,
@@ -150,6 +150,47 @@ impl Perception {
         };
 
         *self.current_screen.lock().await = Some(state);
+    }
+
+    /// Dump the UI tree reliably via a temp file on the device.
+    fn dump_ui_tree(&self) -> Option<String> {
+        let dump_path = "/sdcard/hermitdroid_ui_dump.xml";
+
+        // Step 1: dump to file on device
+        match self.adb(&["shell", "uiautomator", "dump", dump_path]) {
+            Ok(out) => {
+                // uiautomator prints "UI hierchary dumped to: <path>"
+                if !out.contains("dumped to") && !out.contains("hierchary") {
+                    debug!("uiautomator dump unexpected output: {}", out);
+                }
+            }
+            Err(e) => {
+                debug!("uiautomator dump failed: {}", e);
+                return None;
+            }
+        }
+
+        // Step 2: cat the file back
+        match self.adb(&["shell", "cat", dump_path]) {
+            Ok(xml) => {
+                if xml.contains("<hierarchy") && xml.contains("<node") {
+                    let simplified = simplify_ui_xml(&xml);
+                    if simplified.is_empty() {
+                        debug!("UI tree simplified to empty");
+                        None
+                    } else {
+                        Some(simplified)
+                    }
+                } else {
+                    debug!("UI dump file did not contain valid XML (len={})", xml.len());
+                    None
+                }
+            }
+            Err(e) => {
+                debug!("Failed to read UI dump file: {}", e);
+                None
+            }
+        }
     }
 
     /// Take a screenshot, return base64-encoded PNG. Expensive — call sparingly.
@@ -239,6 +280,8 @@ impl Perception {
                 if let Some(tree) = &s.ui_tree {
                     let t = if tree.len() > 4000 { &tree[..4000] } else { tree };
                     out.push_str(&format!("\nUI:\n{}", t));
+                } else {
+                    out.push_str("\nUI: (no UI tree available — use default coordinates or launch the app first)");
                 }
                 out
             }
@@ -280,19 +323,6 @@ impl Perception {
 // ================================================================
 // dumpsys notification parser
 // ================================================================
-//
-// `dumpsys notification --noredact` output looks like:
-//
-//   NotificationRecord(0xabc: pkg=com.whatsapp user=UserHandle{0} ...)
-//     ...
-//     android.title=John
-//     android.text=Hey!
-//     android.bigText=Hey! Are you coming to dinner?
-//     ...
-//   NotificationRecord(0xdef: pkg=com.google.android.gm ...)
-//     ...
-//
-// We walk line by line, detect record boundaries, and extract fields.
 
 fn parse_dumpsys_notifications(raw: &str) -> Vec<Notification> {
     let skip: HashSet<&str> = [
@@ -337,7 +367,6 @@ fn parse_dumpsys_notifications(raw: &str) -> Vec<Notification> {
     for line in raw.lines() {
         let s = line.trim();
 
-        // New notification record
         if s.starts_with("NotificationRecord(") || s.starts_with("NotificationRecord{") {
             flush(
                 &mut results,
@@ -354,12 +383,10 @@ fn parse_dumpsys_notifications(raw: &str) -> Vec<Notification> {
             continue;
         }
 
-        // Skip lines outside a record
         if pkg.is_none() {
             continue;
         }
 
-        // Extract extras
         if s.starts_with("android.title=") {
             title = Some(s["android.title=".len()..].to_string());
         } else if s.starts_with("android.text=") {
@@ -368,9 +395,7 @@ fn parse_dumpsys_notifications(raw: &str) -> Vec<Notification> {
             big_text = Some(s["android.bigText=".len()..].to_string());
         } else if s.starts_with("android.subText=") && text.is_none() {
             text = Some(s["android.subText=".len()..].to_string());
-        }
-        // Some ROMs/versions indent extras differently
-        else if let Some(rest) = s.strip_prefix("String (android.title): ") {
+        } else if let Some(rest) = s.strip_prefix("String (android.title): ") {
             title = Some(rest.to_string());
         } else if let Some(rest) = s.strip_prefix("String (android.text): ") {
             text = Some(rest.to_string());
@@ -379,7 +404,6 @@ fn parse_dumpsys_notifications(raw: &str) -> Vec<Notification> {
         }
     }
 
-    // Flush last record
     flush(
         &mut results,
         &mut pkg,
@@ -392,7 +416,6 @@ fn parse_dumpsys_notifications(raw: &str) -> Vec<Notification> {
     results
 }
 
-/// Extract a field value from a dumpsys line: "pkg=com.whatsapp" → "com.whatsapp"
 fn extract_field(line: &str, prefix: &str) -> Option<String> {
     let start = line.find(prefix)? + prefix.len();
     let rest = &line[start..];
@@ -412,14 +435,11 @@ fn extract_field(line: &str, prefix: &str) -> Option<String> {
 // ================================================================
 
 fn parse_foreground_activity(raw: &str) -> (String, String) {
-    // Look for "mResumedActivity:" or "topResumedActivity:"
-    // Format: mResumedActivity: ActivityRecord{hash u0 com.pkg/.Activity t123}
     for needle in &["mResumedActivity:", "topResumedActivity:"] {
         for line in raw.lines() {
             if !line.contains(needle) {
                 continue;
             }
-            // Find the component name "com.pkg/.Activity"
             if let Some(comp) = find_component_in_line(line) {
                 let parts: Vec<&str> = comp.splitn(2, '/').collect();
                 if parts.len() == 2 {
@@ -429,7 +449,6 @@ fn parse_foreground_activity(raw: &str) -> (String, String) {
         }
     }
 
-    // Fallback: mFocusedApp or mCurrentFocus
     for needle in &["mFocusedApp=", "mCurrentFocus="] {
         for line in raw.lines() {
             if !line.contains(needle) {
@@ -447,7 +466,6 @@ fn parse_foreground_activity(raw: &str) -> (String, String) {
     ("unknown".into(), "unknown".into())
 }
 
-/// Find a "com.package/.ActivityName" component in a line.
 fn find_component_in_line(line: &str) -> Option<String> {
     for word in line.split_whitespace() {
         let w = word.trim_matches(|c: char| c == '{' || c == '}' || c == ')');
@@ -461,14 +479,17 @@ fn find_component_in_line(line: &str) -> Option<String> {
 // ================================================================
 // uiautomator XML simplifier
 // ================================================================
-//
-// `uiautomator dump /dev/tty` outputs XML nodes like:
-//   <node text="Send" resource-id="com.app:id/btn" class="android.widget.Button"
-//     clickable="true" bounds="[200,1600][880,1750]" .../>
-//
-// We convert to a compact text the LLM can reason about.
 
 fn simplify_ui_xml(xml: &str) -> String {
+    // Strip any prefix before the actual XML (e.g., "UI hierchary dumped to: ...")
+    let xml = if let Some(idx) = xml.find("<?xml") {
+        &xml[idx..]
+    } else if let Some(idx) = xml.find("<hierarchy") {
+        &xml[idx..]
+    } else {
+        xml
+    };
+
     let mut out = String::with_capacity(4000);
     let mut depth: usize = 0;
 
@@ -501,8 +522,14 @@ fn simplify_ui_xml(xml: &str) -> String {
         let bounds = xml_attr(chunk, "bounds").unwrap_or_default();
         let center = bounds_center(&bounds);
 
+        // Also detect editable fields (EditText class or focusable+clickable)
+        let is_edit = cls == "EditText"
+            || xml_attr(chunk, "class")
+                .map(|c| c.contains("EditText"))
+                .unwrap_or(false);
+
         let has_info =
-            !text.is_empty() || !desc.is_empty() || click || !rid.is_empty();
+            !text.is_empty() || !desc.is_empty() || click || !rid.is_empty() || is_edit;
 
         if has_info {
             let indent = "  ".repeat(depth.min(8));
@@ -525,6 +552,9 @@ fn simplify_ui_xml(xml: &str) -> String {
             }
             if click {
                 out.push_str(" *click*");
+            }
+            if is_edit {
+                out.push_str(" *editable*");
             }
             if edit {
                 out.push_str(" *focus*");
@@ -558,7 +588,6 @@ fn xml_attr(s: &str, attr: &str) -> Option<String> {
     }
 }
 
-/// Parse "[left,top][right,bottom]" → center (x, y)
 fn bounds_center(bounds: &str) -> Option<(i32, i32)> {
     let nums: Vec<i32> = bounds
         .replace('[', "")
@@ -616,10 +645,10 @@ mod tests {
         "#;
 
         let notifs = parse_dumpsys_notifications(raw);
-        assert_eq!(notifs.len(), 2); // systemui skipped
+        assert_eq!(notifs.len(), 2);
         assert_eq!(notifs[0].app, "com.whatsapp");
         assert_eq!(notifs[0].title, "John");
-        assert_eq!(notifs[0].text, "Hey! Are you coming to dinner tonight?"); // bigText preferred
+        assert_eq!(notifs[0].text, "Hey! Are you coming to dinner tonight?");
         assert_eq!(notifs[1].app, "com.google.android.gm");
         assert_eq!(notifs[1].title, "boss@work.com");
     }
@@ -643,5 +672,15 @@ mod tests {
         assert!(result.contains("\"Hello\""));
         assert!(result.contains("*click*"));
         assert!(result.contains("@(540,150)"));
+    }
+
+    #[test]
+    fn test_simplify_ui_with_prefix() {
+        // Simulate the output from `uiautomator dump /dev/tty` which has a prefix line
+        let xml = "UI hierchary dumped to: /dev/tty\n<?xml version='1.0' encoding='UTF-8' ?><hierarchy rotation=\"0\"><node text=\"Search\" resource-id=\"com.whatsapp:id/search\" class=\"android.widget.EditText\" clickable=\"true\" bounds=\"[0,100][1080,200]\" content-desc=\"\" focused=\"false\" /></hierarchy>";
+        let result = simplify_ui_xml(xml);
+        assert!(result.contains("EditText"));
+        assert!(result.contains("#search"));
+        assert!(result.contains("\"Search\""));
     }
 }

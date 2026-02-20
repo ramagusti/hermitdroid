@@ -1,184 +1,156 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# Hermitdroid — Install Script
-# Sets up Rust, Ollama, pulls a model, builds the project.
-# Run: chmod +x install.sh && ./install.sh
-# ============================================================
+INSTALL_DIR="$HOME/.hermitdroid"
+REPO_URL="https://github.com/ramagusti/hermitdroid.git"
+BIN_DIR="$HOME/.local/bin"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
-ok()    { echo -e "${GREEN}[OK]${NC}   $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
-fail()  { echo -e "${RED}[FAIL]${NC} $*"; }
-
+echo "╔══════════════════════════════════════════╗"
+echo "║       Hermitdroid Installer              ║"
+echo "╚══════════════════════════════════════════╝"
 echo ""
-echo -e "${CYAN}🤖 Hermitdroid — Installer${NC}"
-echo "================================================"
+echo "[INFO] Install directory: $INSTALL_DIR"
 echo ""
 
-# ---- Detect OS ----
-OS="$(uname -s)"
-case "$OS" in
-    Linux*)  PLATFORM=linux ;;
-    Darwin*) PLATFORM=macos ;;
-    *)       fail "Unsupported OS: $OS (need Linux or macOS)"; exit 1 ;;
-esac
-info "Platform: $PLATFORM"
+# --- Helper: install a package ---
+pkg_install() {
+    local pkg="$1"
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq && sudo apt-get install -y -qq "$pkg"
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y "$pkg"
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -S --noconfirm "$pkg"
+    elif command -v brew &>/dev/null; then
+        brew install "$pkg"
+    else
+        echo "[ERROR] Could not detect package manager. Please install $pkg manually."
+        exit 1
+    fi
+}
 
-# ---- Check / Install Rust ----
-if command -v rustc &>/dev/null; then
-    ok "Rust $(rustc --version | awk '{print $2}') already installed"
-else
-    info "Installing Rust..."
+# --- Install dependencies ---
+for dep in zstd git make; do
+    if ! command -v "$dep" &>/dev/null; then
+        echo "[INFO] Installing $dep..."
+        pkg_install "$dep"
+        echo "[OK]   $dep installed"
+    else
+        echo "[OK]   $dep already installed"
+    fi
+done
+
+# --- Install Rust & Cargo ---
+if ! command -v rustc &>/dev/null || ! command -v cargo &>/dev/null; then
+    echo "[INFO] Installing Rust and Cargo via rustup..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
     source "$HOME/.cargo/env"
-    ok "Rust installed: $(rustc --version)"
+    echo "[OK]   Rust installed: $(rustc --version)"
+else
+    echo "[OK]   Rust already installed: $(rustc --version)"
 fi
 
-# ---- Check / Install ADB ----
-if command -v adb &>/dev/null; then
-    ok "ADB already installed"
+# --- Update Rust (need 1.85+ for edition2024) ---
+echo "[INFO] Updating Rust to latest stable..."
+rustup update stable 2>/dev/null
+source "$HOME/.cargo/env" 2>/dev/null || true
+echo "[OK]   Rust version: $(rustc --version)"
+
+RUST_MINOR=$(rustc --version | grep -oP '1\.(\d+)' | head -1 | cut -d. -f2)
+if [ "$RUST_MINOR" -lt 85 ]; then
+    echo "[ERROR] Rust 1.85+ required (you have $(rustc --version))."
+    exit 1
+fi
+
+# --- Clone or update repo ---
+if [ -d "$INSTALL_DIR/.git" ]; then
+    echo "[INFO] Updating existing installation..."
+    cd "$INSTALL_DIR"
+    git pull --ff-only 2>/dev/null || {
+        echo "[WARN] Could not fast-forward. Fetching latest..."
+        git fetch origin
+        git reset --hard origin/main
+    }
 else
-    warn "ADB not found. Installing..."
-    if [ "$PLATFORM" = "linux" ]; then
-        if command -v apt &>/dev/null; then
-            sudo apt update && sudo apt install -y android-tools-adb
-        elif command -v dnf &>/dev/null; then
-            sudo dnf install -y android-tools
-        elif command -v pacman &>/dev/null; then
-            sudo pacman -S --noconfirm android-tools
-        else
-            fail "Can't auto-install ADB. Install Android SDK platform-tools manually."
-            fail "Download: https://developer.android.com/studio/releases/platform-tools"
+    if [ -d "$INSTALL_DIR" ]; then
+        echo "[WARN] $INSTALL_DIR exists but is not a git repo. Backing up..."
+        mv "$INSTALL_DIR" "${INSTALL_DIR}.bak.$(date +%s)"
+    fi
+    echo "[INFO] Cloning hermitdroid into $INSTALL_DIR..."
+    git clone "$REPO_URL" "$INSTALL_DIR"
+    cd "$INSTALL_DIR"
+fi
+
+# --- Fix known build issue ---
+if [ -f "$INSTALL_DIR/src/server/mod.rs" ]; then
+    if grep -q 'R::ok("queued")' "$INSTALL_DIR/src/server/mod.rs"; then
+        echo "[INFO] Applying type fix in src/server/mod.rs..."
+        sed -i 's/R::ok("queued")/R::ok("queued".to_string())/g' "$INSTALL_DIR/src/server/mod.rs"
+        echo "[OK]   Fix applied"
+    fi
+fi
+
+# --- Remove stale lockfile ---
+rm -f "$INSTALL_DIR/Cargo.lock"
+
+# --- Build + Install ---
+echo "[INFO] Building Hermitdroid..."
+cd "$INSTALL_DIR"
+
+if [ -f Makefile ]; then
+    make
+else
+    # Fallback if Makefile not yet in repo
+    cargo build --release
+    mkdir -p "$BIN_DIR"
+    cp -f target/release/hermitdroid "$INSTALL_DIR/hermitdroid"
+    ln -sf "$INSTALL_DIR/hermitdroid" "$BIN_DIR/hermitdroid"
+fi
+
+# --- Copy default workspace if not exists ---
+if [ ! -d "$INSTALL_DIR/workspace" ] && [ -d "$INSTALL_DIR/workspace.default" ]; then
+    echo "[INFO] Creating default workspace..."
+    cp -r "$INSTALL_DIR/workspace.default" "$INSTALL_DIR/workspace"
+    echo "[OK]   Default workspace created at $INSTALL_DIR/workspace/"
+elif [ ! -d "$INSTALL_DIR/workspace" ]; then
+    echo "[INFO] Creating minimal workspace..."
+    mkdir -p "$INSTALL_DIR/workspace/skills"
+    for f in SOUL.md TOOLS.md IDENTITY.md HEARTBEAT.md AGENTS.md USER.md GOALS.md MEMORY.md; do
+        if [ ! -f "$INSTALL_DIR/workspace/$f" ]; then
+            echo "# $f" > "$INSTALL_DIR/workspace/$f"
         fi
-    elif [ "$PLATFORM" = "macos" ]; then
-        if command -v brew &>/dev/null; then
-            brew install android-platform-tools
-        else
-            fail "Install Homebrew first (https://brew.sh) or download platform-tools manually."
-        fi
-    fi
-
-    if command -v adb &>/dev/null; then
-        ok "ADB installed"
-    else
-        warn "ADB installation may have failed. You can install it later."
-    fi
-fi
-
-# ---- Check / Install Ollama ----
-if command -v ollama &>/dev/null; then
-    ok "Ollama already installed"
+    done
+    echo "[OK]   Minimal workspace created"
 else
-    info "Installing Ollama..."
-    curl -fsSL https://ollama.com/install.sh | sh
-    ok "Ollama installed"
+    echo "[OK]   Workspace already exists, skipping"
 fi
 
-# ---- Start Ollama if not running ----
-if curl -s http://localhost:11434/api/tags &>/dev/null; then
-    ok "Ollama is running"
+# --- Check PATH ---
+echo ""
+if echo "$PATH" | grep -q "$BIN_DIR"; then
+    echo "[OK]   ~/.local/bin is in your PATH"
 else
-    info "Starting Ollama..."
-    ollama serve &>/dev/null &
-    sleep 3
-    if curl -s http://localhost:11434/api/tags &>/dev/null; then
-        ok "Ollama started"
-    else
-        warn "Could not start Ollama. Start it manually: ollama serve"
-    fi
+    echo "[INFO] Add ~/.local/bin to your PATH:"
+    echo '         export PATH="$HOME/.local/bin:$PATH"'
+    echo ""
+    echo "       Add it to your shell profile to make it permanent:"
+    echo '         echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.bashrc'
 fi
 
-# ---- Model Selection ----
+# --- Done ---
 echo ""
-echo -e "${CYAN}Choose a model:${NC}"
-echo "  1) yeahdongcn/AutoGLM-Phone-9B  — Built for phone UI control, ~6GB (recommended)"
-echo "  2) qwen2.5-vl:7b                — Vision + reasoning, ~5GB"
-echo "  3) llama3.1:8b                   — Text-only, fast, ~5GB"
-echo "  4) phi3.5:latest                 — Lightweight, ~3GB (for weaker hardware)"
-echo "  5) Skip (I'll pull my own model later)"
+echo "╔══════════════════════════════════════════╗"
+echo "║       ✅ Hermitdroid installed!          ║"
+echo "╚══════════════════════════════════════════╝"
 echo ""
-read -rp "Pick [1-5, default=1]: " MODEL_CHOICE
-MODEL_CHOICE="${MODEL_CHOICE:-1}"
-
-case "$MODEL_CHOICE" in
-    1) MODEL="yeahdongcn/AutoGLM-Phone-9B"; VISION=false ;;
-    2) MODEL="qwen2.5-vl:7b";               VISION=true  ;;
-    3) MODEL="llama3.1:8b";                  VISION=false ;;
-    4) MODEL="phi3.5:latest";                VISION=false ;;
-    5) MODEL=""; VISION=false ;;
-    *) MODEL="yeahdongcn/AutoGLM-Phone-9B"; VISION=false ;;
-esac
-
-if [ -n "$MODEL" ]; then
-    info "Pulling $MODEL (this may take a few minutes)..."
-    ollama pull "$MODEL"
-    ok "Model ready: $MODEL"
-fi
-
-# ---- Build ----
+echo "  Location:  $INSTALL_DIR"
+echo "  Binary:    $BIN_DIR/hermitdroid"
+echo "  Config:    $INSTALL_DIR/config.toml"
 echo ""
-info "Building Hermitdroid..."
-cargo build --release 2>&1 | tail -5
-ok "Build complete: ./target/release/hermitdroid"
-
-# ---- Update config.toml with chosen model ----
-if [ -n "$MODEL" ]; then
-    # Update model name in config
-    sed -i.bak "s|^model = .*|model = \"$MODEL\"|" config.toml
-    # Update vision setting
-    if [ "$VISION" = "true" ]; then
-        sed -i.bak "s|^vision_enabled = .*|vision_enabled = true|" config.toml
-    else
-        sed -i.bak "s|^vision_enabled = .*|vision_enabled = false|" config.toml
-    fi
-    rm -f config.toml.bak
-    ok "config.toml updated with model: $MODEL"
-fi
-
-# ---- Check ADB device ----
+echo "  Next steps:"
+echo "    1. Edit ~/.hermitdroid/config.toml"
+echo "    2. Connect your phone via USB (enable USB Debugging)"
+echo "    3. hermitdroid doctor"
+echo "    4. hermitdroid --dry-run"
+echo "    5. hermitdroid"
 echo ""
-if command -v adb &>/dev/null; then
-    DEVICES=$(adb devices 2>/dev/null | grep -c "device$" || true)
-    if [ "$DEVICES" -gt 0 ]; then
-        ok "ADB: $DEVICES device(s) connected"
-        adb devices -l | grep "device " || true
-    else
-        warn "No ADB device connected."
-        echo ""
-        echo "  To connect via USB:"
-        echo "    1. Enable Developer Options (tap Build Number 7x)"
-        echo "    2. Enable USB Debugging in Developer Options"
-        echo "    3. Plug in USB cable, tap 'Allow' on phone"
-        echo ""
-        echo "  To connect via WiFi:"
-        echo "    adb tcpip 5555"
-        echo "    adb connect <phone-ip>:5555"
-    fi
-fi
-
-# ---- Run doctor ----
-echo ""
-info "Running doctor..."
-./target/release/hermitdroid doctor --config config.toml
-echo ""
-
-# ---- Done ----
-echo "================================================"
-echo -e "${GREEN}✅ Installation complete!${NC}"
-echo ""
-echo "Next steps:"
-echo "  1. Connect your phone via ADB (if not already)"
-echo "  2. Edit workspace/USER.md with your info"
-echo "  3. Test:  ./target/release/hermitdroid --config config.toml --dry-run"
-echo "  4. Run:   ./target/release/hermitdroid --config config.toml"
-echo ""
-echo "Full guide: SETUP_GUIDE.md"
-echo "================================================"

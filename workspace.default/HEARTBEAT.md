@@ -1,7 +1,7 @@
 # HEARTBEAT.md — Heartbeat Contract
 
 ## Interval
-Default: every 30 seconds (configurable).
+Default: every 10 seconds (configurable).
 Gateway heartbeat (background check-in): every 30 minutes.
 
 ## Contract
@@ -30,3 +30,4 @@ This is a deeper check-in:
 - Cron job fires
 - Companion app reconnects
 - Device unlock event
+- If there's a WhatsApp notification and the message asked for location, reply with "Wait" and send
