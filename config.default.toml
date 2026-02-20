@@ -9,18 +9,9 @@ workspace_path = "./workspace"
 bootstrap_max_chars = 20000
 
 [brain]
-# backend = "ollama"
-# # model = "yeahdongcn/AutoGLM-Phone-9B"
-# model = "qwen2.5:3b"
-# endpoint = "http://localhost:11434"
-
-# backend = "codex_oauth"
-# model = "gpt-5.1-codex-mini"
-
-backend = "openai_compatible"
-model = "gemini-2.5-flash"
-endpoint = "https://generativelanguage.googleapis.com/v1beta/openai"
-api_key = "AIzaSyAvbNGSoXtWlIbMLFhirlA9b-fw_jCZHWY"
+backend = "ollama"
+model = "yeahdongcn/AutoGLM-Phone-9B"
+endpoint = "http://localhost:11434"
 
 vision_enabled = true
 max_tokens = 4096

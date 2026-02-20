@@ -128,7 +128,8 @@ impl Perception {
     }
 
     /// Poll current foreground app + UI tree via ADB.
-    pub async fn poll_screen_adb(&self) {
+    /// If `with_screenshot` is true, also captures a screenshot for vision models.
+    pub async fn poll_screen_adb_full(&self, with_screenshot: bool) {
         // 1. Current activity
         let (app, activity) = self
             .adb(&["shell", "dumpsys", "activity", "activities"])
@@ -136,20 +137,29 @@ impl Perception {
             .unwrap_or(("unknown".into(), "unknown".into()));
 
         // 2. UI tree via uiautomator dump
-        // Method: dump to a file on device, then cat it back.
-        // The `/dev/tty` trick can produce garbled output with a prefix line.
-        // Using a temp file is more reliable.
         let ui_tree = self.dump_ui_tree();
+
+        // 3. Screenshot (only when requested — expensive, uses vision API tokens)
+        let screenshot_base64 = if with_screenshot {
+            self.capture_screenshot_adb()
+        } else {
+            None
+        };
 
         let state = ScreenState {
             current_app: app,
             activity,
             ui_tree,
-            screenshot_base64: None,
+            screenshot_base64,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
 
         *self.current_screen.lock().await = Some(state);
+    }
+
+    /// Simple poll without screenshot (backward compatible)
+    pub async fn poll_screen_adb(&self) {
+        self.poll_screen_adb_full(false).await;
     }
 
     /// Dump the UI tree reliably via a temp file on the device.
@@ -250,6 +260,11 @@ impl Perception {
         self.user_commands.lock().await.drain(..).collect()
     }
 
+    /// Check if there are pending user commands without draining them
+    pub async fn peek_user_commands(&self) -> bool {
+        self.user_commands.lock().await.is_empty()
+    }
+
     pub async fn drain_device_events(&self) -> Vec<String> {
         self.device_events.lock().await.drain(..).collect()
     }
@@ -277,11 +292,16 @@ impl Perception {
         match screen {
             Some(s) => {
                 let mut out = format!("App: {} | Activity: {}", s.current_app, s.activity);
+                if s.screenshot_base64.is_some() {
+                    out.push_str("\n📸 SCREENSHOT ATTACHED — Look at the screenshot image to identify exact UI element positions. Use the VISIBLE coordinates from the screenshot for all tap actions. Do NOT guess coordinates.");
+                }
                 if let Some(tree) = &s.ui_tree {
                     let t = if tree.len() > 4000 { &tree[..4000] } else { tree };
-                    out.push_str(&format!("\nUI:\n{}", t));
+                    out.push_str(&format!("\nUI Tree:\n{}", t));
+                } else if s.screenshot_base64.is_some() {
+                    out.push_str("\nUI Tree: (not available — rely on the screenshot image for coordinates)");
                 } else {
-                    out.push_str("\nUI: (no UI tree available — use default coordinates or launch the app first)");
+                    out.push_str("\nUI: (no UI tree or screenshot — use well-known default coordinates)");
                 }
                 out
             }

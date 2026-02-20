@@ -46,8 +46,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/update/check", get(check_update))
         .route("/update/install", post(install_update))
         // Workspace files (OpenClaw-style)
-        .route("/workspace/{filename}", get(read_workspace_file))
-        .route("/workspace/{filename}", post(write_workspace_file))
+        .route("/workspace/*filename", get(read_workspace_file))
+        .route("/workspace/*filename", post(write_workspace_file))
         // Memory
         .route("/memory", get(read_memory))
         .route("/memory/daily", get(read_daily_memory))
@@ -290,14 +290,16 @@ async fn install_update() -> impl IntoResponse {
 // ---- Workspace ----
 
 async fn read_workspace_file(State(s): State<AppState>, Path(f): Path<String>) -> impl IntoResponse {
-    R::ok(s.workspace.read_file(&f))
+    let filename = f.trim_start_matches('/');
+    R::ok(s.workspace.read_file(filename))
 }
 
 #[derive(Deserialize)]
 struct WriteBody { content: String }
 
 async fn write_workspace_file(State(s): State<AppState>, Path(f): Path<String>, Json(b): Json<WriteBody>) -> impl IntoResponse {
-    match s.workspace.write_file(&f, &b.content) {
+    let filename = f.trim_start_matches('/');
+    match s.workspace.write_file(filename, &b.content) {
         Ok(()) => R::ok("written".to_string()),
         Err(e) => R::err(&e.to_string()),
     }

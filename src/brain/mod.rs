@@ -192,13 +192,33 @@ impl Brain {
         if !ctx.heartbeat.is_empty() {
             prompt.push_str(&format!("--- HEARTBEAT.md ---\n{}\n\n", ctx.heartbeat));
         }
-
         if let Some(bootstrap) = &ctx.bootstrap {
             prompt.push_str(&format!("--- BOOTSTRAP.md (FIRST RUN) ---\n{}\n\n", bootstrap));
         }
-
         for skill in &ctx.skills {
             prompt.push_str(&format!("--- SKILL: {} ---\n{}\n\n", skill.name, skill.content));
+        }
+
+        // Vision instructions (when screenshots are enabled)
+        if self.config.vision_enabled {
+            prompt.push_str(
+                r#"--- VISION INSTRUCTIONS ---
+                You have access to a screenshot of the phone screen. When a screenshot is attached:
+                1. LOOK at the screenshot to identify exact positions of UI elements (buttons, text fields, icons)
+                2. Use the VISIBLE coordinates from the screenshot for all tap/click actions
+                3. The screen resolution is 1080x2340. Estimate x,y coordinates based on where elements appear in the image
+                4. DO NOT guess coordinates from memory — always derive them from the screenshot
+                5. If the screenshot shows a different screen than expected, adjust your plan accordingly
+                6. Common WhatsApp elements:
+                - Search icon: usually top-right area, look for magnifying glass icon
+                - Message input: bottom of chat screen, look for "Type a message" text field
+                - Send button: right side of message input field, look for arrow/send icon
+                - Chat list items: middle of screen, each chat takes about 80px height
+                7. When you see the UI Tree alongside the screenshot, cross-reference both:
+                - UI Tree gives exact bounds like @(x,y) — USE THESE when available
+                - Screenshot confirms what's actually visible on screen
+                "#
+            );
         }
 
         prompt
@@ -271,7 +291,6 @@ impl Brain {
     /// Parse raw LLM text into structured AgentResponse
     pub fn parse_response(&self, raw: &str) -> AgentResponse {
         let trimmed = raw.trim();
-
         if trimmed.contains("HEARTBEAT_OK") {
             return AgentResponse {
                 reflection: Some("HEARTBEAT_OK".into()),
@@ -279,42 +298,62 @@ impl Brain {
             };
         }
 
-        // Sanitize common LLM output issues before JSON parsing
         let sanitized = sanitize_llm_json(trimmed);
 
+        // Try normal parse
         if let Some(json_str) = extract_json(&sanitized) {
-            match serde_json::from_str::<AgentResponse>(&json_str) {
-                Ok(resp) => return resp,
-                Err(e) => {
-                    warn!("JSON parse failed: {}. Attempting lenient parse...", e);
-                    // Try parsing as a generic Value first to diagnose
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                        // Manually extract fields for resilience
-                        return AgentResponse {
-                            actions: val.get("actions")
-                                .and_then(|a| serde_json::from_value(a.clone()).ok())
-                                .unwrap_or_default(),
-                            reflection: val.get("reflection")
-                                .and_then(|v| v.as_str())
-                                .map(String::from),
-                            message: val.get("message")
-                                .and_then(|v| v.as_str())
-                                .map(String::from),
-                            memory_write: val.get("memory_write")
-                                .and_then(|v| v.as_str())
-                                .map(String::from),
-                        };
-                    }
-                    warn!("Lenient parse also failed for: {}...", &json_str.chars().take(200).collect::<String>());
-                }
+            if let Some(resp) = self.try_parse_json(&json_str) {
+                return resp;
             }
         }
 
+        // Try repairing truncated JSON
+        let repaired = repair_truncated_json(&sanitized);
+        if let Some(json_str) = extract_json(&repaired) {
+            if let Some(resp) = self.try_parse_json(&json_str) {
+                warn!("Recovered actions from truncated JSON response");
+                return resp;
+            }
+        }
+
+        // Try extracting individual actions from broken JSON
+        if let Some(actions) = extract_partial_actions(&sanitized) {
+            if !actions.is_empty() {
+                warn!("Extracted {} action(s) from malformed JSON", actions.len());
+                return AgentResponse {
+                    actions,
+                    reflection: Some("(partial response recovered)".into()),
+                    ..Default::default()
+                };
+            }
+        }
+
+        warn!("Could not parse any JSON from LLM response (len={})", trimmed.len());
         AgentResponse {
-            reflection: Some(trimmed.to_string()),
-            message: Some(trimmed.to_string()),
+            reflection: Some(trimmed.chars().take(500).collect()),
+            message: None,
             ..Default::default()
         }
+    }
+
+    fn try_parse_json(&self, json_str: &str) -> Option<AgentResponse> {
+        if let Ok(resp) = serde_json::from_str::<AgentResponse>(json_str) {
+            return Some(resp);
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+            return Some(AgentResponse {
+                actions: val.get("actions")
+                    .and_then(|a| serde_json::from_value(a.clone()).ok())
+                    .unwrap_or_default(),
+                reflection: val.get("reflection")
+                    .and_then(|v| v.as_str()).map(String::from),
+                message: val.get("message")
+                    .and_then(|v| v.as_str()).map(String::from),
+                memory_write: val.get("memory_write")
+                    .and_then(|v| v.as_str()).map(String::from),
+            });
+        }
+        None
     }
 
     // ---- Backend implementations ----
@@ -602,6 +641,90 @@ fn sanitize_llm_json(text: &str) -> String {
     }
 
     String::from_utf8(cleaned).unwrap_or(s)
+}
+fn repair_truncated_json(s: &str) -> String {
+    let start = match s.find('{') {
+        Some(i) => i,
+        None => return s.to_string(),
+    };
+    let json_part = &s[start..];
+    let mut result = json_part.to_string();
+
+    // Remove trailing incomplete string (odd number of quotes)
+    let quote_count = result.chars().filter(|&c| c == '"').count();
+    if quote_count % 2 != 0 {
+        if let Some(last_quote) = result.rfind('"') {
+            if let Some(last_comma) = result[..last_quote].rfind(',') {
+                result = result[..last_comma].to_string();
+            } else if let Some(last_brace) = result[..last_quote].rfind('{') {
+                result = result[..=last_brace].to_string();
+            }
+        }
+    }
+
+    // Remove trailing comma
+    let trimmed = result.trim_end();
+    if trimmed.ends_with(',') {
+        result = trimmed[..trimmed.len()-1].to_string();
+    }
+
+    // Count and close open braces/brackets
+    let mut open_braces = 0i32;
+    let mut open_brackets = 0i32;
+    let mut in_string = false;
+    let mut prev_char = ' ';
+    for c in result.chars() {
+        if c == '"' && prev_char != '\\' { in_string = !in_string; }
+        if !in_string {
+            match c {
+                '{' => open_braces += 1,
+                '}' => open_braces -= 1,
+                '[' => open_brackets += 1,
+                ']' => open_brackets -= 1,
+                _ => {}
+            }
+        }
+        prev_char = c;
+    }
+    for _ in 0..open_brackets { result.push(']'); }
+    for _ in 0..open_braces { result.push('}'); }
+    result
+}
+
+fn extract_partial_actions(s: &str) -> Option<Vec<AgentAction>> {
+    let actions_start = s.find("\"actions\"")
+        .and_then(|i| s[i..].find('[').map(|j| i + j))?;
+    let rest = &s[actions_start..];
+    let mut actions: Vec<AgentAction> = Vec::new();
+    let mut depth = 0;
+    let mut obj_start: Option<usize> = None;
+    let mut in_string = false;
+    let mut prev = ' ';
+
+    for (i, c) in rest.char_indices() {
+        if c == '"' && prev != '\\' { in_string = !in_string; }
+        if !in_string {
+            if c == '{' {
+                if depth == 1 { obj_start = Some(i); }
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 1 {
+                    if let Some(start) = obj_start {
+                        let obj_str = &rest[start..=i];
+                        if let Ok(action) = serde_json::from_str::<AgentAction>(obj_str) {
+                            actions.push(action);
+                        }
+                        obj_start = None;
+                    }
+                }
+            } else if c == ']' && depth == 1 {
+                break;
+            }
+        }
+        prev = c;
+    }
+    if actions.is_empty() { None } else { Some(actions) }
 }
 
 fn extract_json(text: &str) -> Option<String> {

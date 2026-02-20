@@ -326,7 +326,11 @@ async fn heartbeat_tick(
         if has_priority {
             info!("⚡ Priority notification detected");
         }
-        perception.poll_screen_adb().await;
+        // Capture screenshot when there are pending commands (active task)
+        // This gives the vision model actual screen data for accurate taps
+        let commands_pending = !perception.peek_user_commands().await;
+        let use_screenshot = has_priority || commands_pending;
+        perception.poll_screen_adb_full(use_screenshot).await;
     }
 
     // 1. Gather context
@@ -423,9 +427,10 @@ async fn heartbeat_tick(
                         let remaining = response.actions.len() - i - 1;
                         info!("  ⏸ Pausing after {} UI actions — {} remaining, will re-poll screen", ui_changed_count, remaining);
 
-                        // Re-poll screen immediately
+                        // Re-poll screen immediately WITH screenshot
+                        // so the continuation tick has real visual data
                         if bridge_mode == "adb" {
-                            perception.poll_screen_adb().await;
+                            perception.poll_screen_adb_full(true).await;
                         }
 
                         // Re-inject remaining actions as a continuation command

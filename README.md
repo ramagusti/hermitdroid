@@ -84,7 +84,7 @@ Edit `~/.hermitdroid/config.toml`:
 ```toml
 [brain]
 backend = "ollama"
-model = "qwen2.5:3b"          # or any model you've pulled
+model = "yeahdongcn/AutoGLM-Phone-9B"          # or any model you've pulled
 endpoint = "http://localhost:11434"
 vision_enabled = false
 ```
@@ -92,7 +92,7 @@ vision_enabled = false
 ```bash
 # Install Ollama and pull a model:
 curl -fsSL https://ollama.com/install.sh | sh
-ollama pull qwen2.5:3b
+ollama pull yeahdongcn/AutoGLM-Phone-9B
 ```
 
 ### Option B: ChatGPT subscription (Codex OAuth) — uses your existing Plus/Pro plan
@@ -112,7 +112,7 @@ codex login                    # opens browser, authenticates with ChatGPT
 
 This reads your token from `~/.codex/auth.json` automatically. No API key needed — it bills to your ChatGPT subscription.
 
-### Option C: OpenAI API key (pay-per-token)
+### Option C: LLM APIs  (pay-per-token)
 
 ```toml
 [brain]
