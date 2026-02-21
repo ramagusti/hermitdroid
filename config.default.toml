@@ -41,6 +41,9 @@ host = "0.0.0.0"
 port = 8420
 # auth_token = "your-secret-token"  # uncomment for production
 
+[tailscale]
+enabled = false
+
 # === Cron Jobs (OpenClaw-style scheduled tasks) ===
 # [[cron]]
 # name = "morning-summary"

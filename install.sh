@@ -1,156 +1,315 @@
 #!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════╗
+# ║          Hermitdroid — Installer                     ║
+# ╚══════════════════════════════════════════════════════╝
+#
+# Installs to:
+#   ~/.hermitdroid/           workspace, config, logs
+#   ~/.local/bin/hermitdroid  binary
+#
+# No source code, .git history, or build artifacts are kept.
+
 set -euo pipefail
 
-INSTALL_DIR="$HOME/.hermitdroid"
-REPO_URL="https://github.com/ramagusti/hermitdroid.git"
-BIN_DIR="$HOME/.local/bin"
+BOLD="\033[1m"
+DIM="\033[2m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+CYAN="\033[36m"
+RESET="\033[0m"
 
-echo "╔══════════════════════════════════════════╗"
-echo "║       Hermitdroid Installer              ║"
-echo "╚══════════════════════════════════════════╝"
-echo ""
-echo "[INFO] Install directory: $INSTALL_DIR"
-echo ""
+INSTALL_DIR="${HERMITDROID_DIR:-$HOME/.hermitdroid}"
+BIN_DIR="${HERMITDROID_BIN:-$HOME/.local/bin}"
+REPO_URL="${HERMITDROID_REPO:-https://github.com/ramagusti/hermitdroid.git}"
 
-# --- Helper: install a package ---
-pkg_install() {
-    local pkg="$1"
-    if command -v apt-get &>/dev/null; then
-        sudo apt-get update -qq && sudo apt-get install -y -qq "$pkg"
-    elif command -v dnf &>/dev/null; then
-        sudo dnf install -y "$pkg"
-    elif command -v pacman &>/dev/null; then
-        sudo pacman -S --noconfirm "$pkg"
-    elif command -v brew &>/dev/null; then
-        brew install "$pkg"
+info()  { echo -e "  ${GREEN}✓${RESET} $*"; }
+warn()  { echo -e "  ${YELLOW}⚠${RESET} $*"; }
+fail()  { echo -e "  ${RED}✗${RESET} $*"; exit 1; }
+step()  { echo -e "\n${CYAN}━━━ $* ━━━${RESET}\n"; }
+
+command_exists() { command -v "$1" &>/dev/null; }
+
+# ── Banner ───────────────────────────────────────────────────────────────────
+
+echo -e "
+${CYAN}${BOLD}╔══════════════════════════════════════════════════════╗
+║           🤖 Hermitdroid Installer                   ║
+╚══════════════════════════════════════════════════════╝${RESET}
+"
+
+# ── Check & install dependencies ─────────────────────────────────────────────
+
+step "Checking dependencies"
+
+# Rust
+if command_exists cargo; then
+    info "Rust/Cargo found: $(cargo --version)"
+else
+    warn "Rust not found. Installing via rustup..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    source "$HOME/.cargo/env"
+    info "Rust installed: $(cargo --version)"
+fi
+
+# Git
+if command_exists git; then
+    info "Git found"
+else
+    fail "Git is required. Install: sudo apt install git"
+fi
+
+# ADB
+if command_exists adb; then
+    info "ADB found: $(adb version | head -1)"
+else
+    warn "ADB not found (needed for phone control)"
+    echo -e "    ${DIM}Linux: sudo apt install adb${RESET}"
+    echo -e "    ${DIM}macOS: brew install android-platform-tools${RESET}"
+fi
+
+# Tailscale — auto-install if not present
+if command_exists tailscale; then
+    info "Tailscale found"
+    if tailscale status &>/dev/null; then
+        info "Tailscale connected: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
     else
-        echo "[ERROR] Could not detect package manager. Please install $pkg manually."
-        exit 1
+        echo -e "  ${DIM}ℹ  Tailscale installed but not connected. Run: sudo tailscale up${RESET}"
     fi
-}
+else
+    echo -e "  ${YELLOW}⚠${RESET}  Tailscale not found (needed for remote access)"
+    echo ""
+    read -p "  Install Tailscale now? [Y/n] " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        echo -e "  Installing Tailscale..."
 
-# --- Install dependencies ---
-for dep in zstd git make; do
-    if ! command -v "$dep" &>/dev/null; then
-        echo "[INFO] Installing $dep..."
-        pkg_install "$dep"
-        echo "[OK]   $dep installed"
+        if [ -f /etc/os-release ]; then
+            . /etc/os-release
+            case "$ID" in
+                ubuntu|debian|pop|linuxmint|elementary|zorin|kali)
+                    curl -fsSL https://tailscale.com/install.sh | sh
+                    ;;
+                fedora|rhel|centos|rocky|alma)
+                    sudo dnf install -y tailscale 2>/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
+                    ;;
+                arch|manjaro|endeavouros)
+                    sudo pacman -S --noconfirm tailscale 2>/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
+                    ;;
+                *)
+                    curl -fsSL https://tailscale.com/install.sh | sh
+                    ;;
+            esac
+        elif [[ "$(uname)" == "Darwin" ]]; then
+            if command_exists brew; then
+                brew install tailscale
+            else
+                echo -e "  ${YELLOW}⚠${RESET}  Install Homebrew first, or get Tailscale from https://tailscale.com/download/mac"
+            fi
+        else
+            curl -fsSL https://tailscale.com/install.sh | sh
+        fi
+
+        if command_exists tailscale; then
+            info "Tailscale installed: $(tailscale version 2>/dev/null | head -1)"
+
+            # Enable and start the service
+            if command_exists systemctl; then
+                sudo systemctl enable --now tailscaled 2>/dev/null || true
+            fi
+
+            echo ""
+            read -p "  Log into Tailscale now? [Y/n] " -n 1 -r
+            echo ""
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                sudo tailscale up
+                if tailscale status &>/dev/null; then
+                    info "Tailscale connected: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
+                else
+                    warn "Tailscale login may not have completed. Run: sudo tailscale up"
+                fi
+            fi
+        else
+            warn "Tailscale installation failed. Install manually: https://tailscale.com/download"
+        fi
     else
-        echo "[OK]   $dep already installed"
+        echo -e "  ${DIM}Skipped. Install later: curl -fsSL https://tailscale.com/install.sh | sh${RESET}"
+    fi
+fi
+
+# ── Build ────────────────────────────────────────────────────────────────────
+
+step "Building"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/Cargo.toml" ] && grep -q "hermitdroid" "$SCRIPT_DIR/Cargo.toml" 2>/dev/null; then
+    BUILD_SRC="$SCRIPT_DIR"
+    info "Dev mode — building from $BUILD_SRC (working tree)"
+    CLEANUP_BUILD=false
+else
+    BUILD_SRC=$(mktemp -d)/hermitdroid
+    CLEANUP_BUILD=true
+    trap "rm -rf '$(dirname "$BUILD_SRC")'" EXIT
+    echo -e "  Cloning into temp directory..."
+    git clone --depth 1 "$REPO_URL" "$BUILD_SRC" 2>&1 | tail -2
+    info "Cloned (shallow)"
+fi
+
+cd "$BUILD_SRC"
+echo -e "  Compiling (this may take a few minutes)..."
+cargo build --release 2>&1 | tail -3
+info "Build complete"
+
+# ── Install binary ───────────────────────────────────────────────────────────
+
+step "Installing"
+
+mkdir -p "$BIN_DIR"
+rm -f "$BIN_DIR/hermitdroid"
+cp "$BUILD_SRC/target/release/hermitdroid" "$BIN_DIR/hermitdroid"
+chmod +x "$BIN_DIR/hermitdroid"
+info "Binary → $BIN_DIR/hermitdroid"
+
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    warn "$BIN_DIR is not in your PATH"
+    echo -e "    Add to your shell profile (~/.bashrc, ~/.zshrc):"
+    echo -e "    ${DIM}export PATH=\"$BIN_DIR:\$PATH\"${RESET}"
+    export PATH="$BIN_DIR:$PATH"
+fi
+
+# ── Set up ~/.hermitdroid ────────────────────────────────────────────────────
+
+step "Setting up workspace"
+
+mkdir -p "$INSTALL_DIR/workspace/memory"
+mkdir -p "$INSTALL_DIR/workspace/skills"
+mkdir -p "$INSTALL_DIR/workspace/canvas"
+
+# Copy default workspace files from repo
+# Priority: workspace.default/ > workspace/ > create empty
+REPO_WS_DEFAULT="$BUILD_SRC/workspace.default"
+REPO_WS="$BUILD_SRC/workspace"
+
+for file in SOUL.md IDENTITY.md AGENTS.md TOOLS.md USER.md HEARTBEAT.md MEMORY.md GOALS.md BOOTSTRAP.md; do
+    if [ ! -f "$INSTALL_DIR/workspace/$file" ]; then
+        if [ -f "$REPO_WS_DEFAULT/$file" ]; then
+            cp "$REPO_WS_DEFAULT/$file" "$INSTALL_DIR/workspace/$file"
+            info "$file (from defaults)"
+        elif [ -f "$REPO_WS/$file" ]; then
+            cp "$REPO_WS/$file" "$INSTALL_DIR/workspace/$file"
+            info "$file (from repo)"
+        else
+            touch "$INSTALL_DIR/workspace/$file"
+            info "$file (created empty)"
+        fi
+    else
+        echo -e "  ${DIM}$file already exists (preserved)${RESET}"
     fi
 done
 
-# --- Install Rust & Cargo ---
-if ! command -v rustc &>/dev/null || ! command -v cargo &>/dev/null; then
-    echo "[INFO] Installing Rust and Cargo via rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    source "$HOME/.cargo/env"
-    echo "[OK]   Rust installed: $(rustc --version)"
-else
-    echo "[OK]   Rust already installed: $(rustc --version)"
-fi
-
-# --- Update Rust (need 1.85+ for edition2024) ---
-echo "[INFO] Updating Rust to latest stable..."
-rustup update stable 2>/dev/null
-source "$HOME/.cargo/env" 2>/dev/null || true
-echo "[OK]   Rust version: $(rustc --version)"
-
-RUST_MINOR=$(rustc --version | grep -oP '1\.(\d+)' | head -1 | cut -d. -f2)
-if [ "$RUST_MINOR" -lt 85 ]; then
-    echo "[ERROR] Rust 1.85+ required (you have $(rustc --version))."
-    exit 1
-fi
-
-# --- Clone or update repo ---
-if [ -d "$INSTALL_DIR/.git" ]; then
-    echo "[INFO] Updating existing installation..."
-    cd "$INSTALL_DIR"
-    git pull --ff-only 2>/dev/null || {
-        echo "[WARN] Could not fast-forward. Fetching latest..."
-        git fetch origin
-        git reset --hard origin/main
-    }
-else
-    if [ -d "$INSTALL_DIR" ]; then
-        echo "[WARN] $INSTALL_DIR exists but is not a git repo. Backing up..."
-        mv "$INSTALL_DIR" "${INSTALL_DIR}.bak.$(date +%s)"
-    fi
-    echo "[INFO] Cloning hermitdroid into $INSTALL_DIR..."
-    git clone "$REPO_URL" "$INSTALL_DIR"
-    cd "$INSTALL_DIR"
-fi
-
-# --- Fix known build issue ---
-if [ -f "$INSTALL_DIR/src/server/mod.rs" ]; then
-    if grep -q 'R::ok("queued")' "$INSTALL_DIR/src/server/mod.rs"; then
-        echo "[INFO] Applying type fix in src/server/mod.rs..."
-        sed -i 's/R::ok("queued")/R::ok("queued".to_string())/g' "$INSTALL_DIR/src/server/mod.rs"
-        echo "[OK]   Fix applied"
-    fi
-fi
-
-# --- Remove stale lockfile ---
-rm -f "$INSTALL_DIR/Cargo.lock"
-
-# --- Build + Install ---
-echo "[INFO] Building Hermitdroid..."
-cd "$INSTALL_DIR"
-
-if [ -f Makefile ]; then
-    make
-else
-    # Fallback if Makefile not yet in repo
-    cargo build --release
-    mkdir -p "$BIN_DIR"
-    cp -f target/release/hermitdroid "$INSTALL_DIR/hermitdroid"
-    ln -sf "$INSTALL_DIR/hermitdroid" "$BIN_DIR/hermitdroid"
-fi
-
-# --- Copy default workspace if not exists ---
-if [ ! -d "$INSTALL_DIR/workspace" ] && [ -d "$INSTALL_DIR/workspace.default" ]; then
-    echo "[INFO] Creating default workspace..."
-    cp -r "$INSTALL_DIR/workspace.default" "$INSTALL_DIR/workspace"
-    echo "[OK]   Default workspace created at $INSTALL_DIR/workspace/"
-elif [ ! -d "$INSTALL_DIR/workspace" ]; then
-    echo "[INFO] Creating minimal workspace..."
-    mkdir -p "$INSTALL_DIR/workspace/skills"
-    for f in SOUL.md TOOLS.md IDENTITY.md HEARTBEAT.md AGENTS.md USER.md GOALS.md MEMORY.md; do
-        if [ ! -f "$INSTALL_DIR/workspace/$f" ]; then
-            echo "# $f" > "$INSTALL_DIR/workspace/$f"
+# Copy skills from repo if any
+for skill_src in "$REPO_WS_DEFAULT"/skills/*/ "$REPO_WS"/skills/*/; do
+    if [ -d "$skill_src" ]; then
+        skill_name=$(basename "$skill_src")
+        skill_dest="$INSTALL_DIR/workspace/skills/$skill_name"
+        if [ ! -d "$skill_dest" ]; then
+            cp -r "$skill_src" "$skill_dest"
+            info "Skill: $skill_name"
         fi
-    done
-    echo "[OK]   Minimal workspace created"
+    fi
+done 2>/dev/null || true
+
+# Config — use absolute workspace_path so hermitdroid works from any directory
+if [ ! -f "$INSTALL_DIR/config.toml" ]; then
+    if [ -f "$BUILD_SRC/config.toml" ]; then
+        sed "s|workspace_path = \"./workspace\"|workspace_path = \"$INSTALL_DIR/workspace\"|g" \
+            "$BUILD_SRC/config.toml" > "$INSTALL_DIR/config.toml"
+        info "Config → $INSTALL_DIR/config.toml"
+    else
+        warn "No config.toml in repo — onboard wizard will create one"
+    fi
 else
-    echo "[OK]   Workspace already exists, skipping"
+    # Fix workspace_path if it's still relative
+    if grep -q 'workspace_path = "\./workspace"' "$INSTALL_DIR/config.toml" 2>/dev/null; then
+        sed -i "s|workspace_path = \"./workspace\"|workspace_path = \"$INSTALL_DIR/workspace\"|g" \
+            "$INSTALL_DIR/config.toml"
+        info "Fixed workspace_path → $INSTALL_DIR/workspace"
+    fi
+    info "Config already exists (preserved)"
 fi
 
-# --- Check PATH ---
+# ── Show what's installed ────────────────────────────────────────────────────
+
 echo ""
-if echo "$PATH" | grep -q "$BIN_DIR"; then
-    echo "[OK]   ~/.local/bin is in your PATH"
-else
-    echo "[INFO] Add ~/.local/bin to your PATH:"
-    echo '         export PATH="$HOME/.local/bin:$PATH"'
+echo -e "  ${BOLD}Installed:${RESET}"
+echo -e "    ${DIM}$BIN_DIR/hermitdroid${RESET}              (binary)"
+echo -e "    ${DIM}$INSTALL_DIR/config.toml${RESET}          (configuration)"
+echo -e "    ${DIM}$INSTALL_DIR/workspace/${RESET}            (agent workspace)"
+
+WS_FILES=$(find "$INSTALL_DIR/workspace" -maxdepth 1 -name "*.md" -size +0c | wc -l)
+echo -e "    ${DIM}$WS_FILES workspace files with content${RESET}"
+
+# ── Launch onboarding ────────────────────────────────────────────────────────
+
+step "Setup"
+
+CONFIG_FILE="$INSTALL_DIR/config.toml"
+
+if [ -f "$CONFIG_FILE" ]; then
+    echo -e "  Config exists at ${BOLD}$CONFIG_FILE${RESET}"
     echo ""
-    echo "       Add it to your shell profile to make it permanent:"
-    echo '         echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.bashrc'
+    read -p "  Run the setup wizard? [Y/n] " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        "$BIN_DIR/hermitdroid" --config "$CONFIG_FILE" onboard
+    else
+        info "Keeping existing configuration"
+    fi
+else
+    echo -e "  ${BOLD}Launching first-run setup wizard...${RESET}\n"
+    "$BIN_DIR/hermitdroid" --config "$CONFIG_FILE" onboard
 fi
 
-# --- Done ---
-echo ""
-echo "╔══════════════════════════════════════════╗"
-echo "║       ✅ Hermitdroid installed!          ║"
-echo "╚══════════════════════════════════════════╝"
-echo ""
-echo "  Location:  $INSTALL_DIR"
-echo "  Binary:    $BIN_DIR/hermitdroid"
-echo "  Config:    $INSTALL_DIR/config.toml"
-echo ""
-echo "  Next steps:"
-echo "    1. Edit ~/.hermitdroid/config.toml"
-echo "    2. Connect your phone via USB (enable USB Debugging)"
-echo "    3. hermitdroid doctor"
-echo "    4. hermitdroid --dry-run"
-echo "    5. hermitdroid"
-echo ""
+# ── Verify ───────────────────────────────────────────────────────────────────
+
+step "Verification"
+
+"$BIN_DIR/hermitdroid" --config "$CONFIG_FILE" doctor 2>/dev/null \
+    && info "Health check passed" \
+    || warn "Health check has issues (see above)"
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+
+echo -e "
+${CYAN}${BOLD}╔══════════════════════════════════════════════════════╗
+║           ✅  Installation Complete!                  ║
+╚══════════════════════════════════════════════════════╝${RESET}
+
+  ${BOLD}Usage:${RESET}
+    hermitdroid                    Start the agent (gateway)
+    hermitdroid gateway            Start the agent (explicit)
+    hermitdroid onboard            Run setup wizard
+    hermitdroid doctor             Check workspace & config health
+    hermitdroid status             Show agent status
+    hermitdroid chat \"message\"     Send a command to running agent
+    hermitdroid stop               Pause the agent
+    hermitdroid restart            Restart the agent
+    hermitdroid logs               Follow agent logs
+    hermitdroid service install    Install as systemd background service
+    hermitdroid service status     Check service status
+    hermitdroid --dry-run          Test without executing actions
+
+  ${BOLD}Files:${RESET}
+    Binary:    $BIN_DIR/hermitdroid
+    Config:    $CONFIG_FILE
+    Workspace: $INSTALL_DIR/workspace/
+"
+
+if command_exists tailscale && tailscale status &>/dev/null; then
+    TS_IP=$(tailscale ip -4 2>/dev/null || echo "")
+    if [ -n "$TS_IP" ]; then
+        echo -e "  ${BOLD}Remote Access (Tailscale):${RESET}"
+        echo -e "    Dashboard: ${DIM}http://${TS_IP}:8420${RESET}"
+        echo ""
+    fi
+fi

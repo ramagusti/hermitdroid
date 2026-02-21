@@ -65,11 +65,13 @@ pub struct Perception {
     /// Notification keys we already reported — only report new ones
     seen_keys: Arc<Mutex<HashSet<String>>>,
     priority_apps: Vec<String>,
+    /// Detected screen resolution (width x height)
+    screen_resolution: Arc<Mutex<Option<(u32, u32)>>>,
 }
 
 impl Perception {
     pub fn new(adb_device: Option<String>, priority_apps: Vec<String>) -> Self {
-        Self {
+        let p = Self {
             adb_device,
             notifications: Arc::new(Mutex::new(Vec::new())),
             current_screen: Arc::new(Mutex::new(None)),
@@ -77,7 +79,32 @@ impl Perception {
             device_events: Arc::new(Mutex::new(Vec::new())),
             seen_keys: Arc::new(Mutex::new(HashSet::new())),
             priority_apps,
+            screen_resolution: Arc::new(Mutex::new(None)),
+        };
+        // Detect resolution on init
+        if let Ok(raw) = p.adb(&["shell", "wm", "size"]) {
+            // Output: "Physical size: 1080x2340"
+            if let Some(size_str) = raw.split(':').last() {
+                let parts: Vec<&str> = size_str.trim().split('x').collect();
+                if parts.len() == 2 {
+                    if let (Ok(w), Ok(h)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                        let res = std::sync::Mutex::new(Some((w, h)));
+                        // Can't use async here, so set directly
+                        info!("📱 Screen resolution: {}x{}", w, h);
+                        return Self {
+                            screen_resolution: Arc::new(Mutex::new(Some((w, h)))),
+                            ..p
+                        };
+                    }
+                }
+            }
         }
+        p
+    }
+
+    /// Get the detected screen resolution
+    pub async fn get_resolution(&self) -> Option<(u32, u32)> {
+        *self.screen_resolution.lock().await
     }
 
     // ================================================================
@@ -288,18 +315,27 @@ impl Perception {
             .join("\n")
     }
 
-    pub fn format_screen(screen: &Option<ScreenState>) -> String {
+    pub fn format_screen_with_resolution(screen: &Option<ScreenState>, resolution: Option<(u32, u32)>) -> String {
         match screen {
             Some(s) => {
                 let mut out = format!("App: {} | Activity: {}", s.current_app, s.activity);
+                if let Some((w, h)) = resolution {
+                    out.push_str(&format!(" | Screen: {}x{}", w, h));
+                }
                 if s.screenshot_base64.is_some() {
-                    out.push_str("\n📸 SCREENSHOT ATTACHED — Look at the screenshot image to identify exact UI element positions. Use the VISIBLE coordinates from the screenshot for all tap actions. Do NOT guess coordinates.");
+                    let res_hint = resolution
+                        .map(|(w, h)| format!("Resolution is {}x{}. ", w, h))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "\n📸 SCREENSHOT ATTACHED — {}Look at the screenshot to identify exact UI element positions. Use VISIBLE coordinates from the screenshot for all tap actions. Do NOT guess coordinates.",
+                        res_hint
+                    ));
                 }
                 if let Some(tree) = &s.ui_tree {
                     let t = if tree.len() > 4000 { &tree[..4000] } else { tree };
                     out.push_str(&format!("\nUI Tree:\n{}", t));
                 } else if s.screenshot_base64.is_some() {
-                    out.push_str("\nUI Tree: (not available — rely on the screenshot image for coordinates)");
+                    out.push_str("\nUI Tree: (not available — rely on the screenshot for coordinates)");
                 } else {
                     out.push_str("\nUI: (no UI tree or screenshot — use well-known default coordinates)");
                 }
@@ -307,6 +343,11 @@ impl Perception {
             }
             None => "No screen state available.".into(),
         }
+    }
+
+    /// Backward-compatible version without resolution
+    pub fn format_screen(screen: &Option<ScreenState>) -> String {
+        Self::format_screen_with_resolution(screen, None)
     }
 
     // ================================================================

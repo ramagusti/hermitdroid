@@ -203,20 +203,15 @@ impl Brain {
         if self.config.vision_enabled {
             prompt.push_str(
                 r#"--- VISION INSTRUCTIONS ---
-                You have access to a screenshot of the phone screen. When a screenshot is attached:
-                1. LOOK at the screenshot to identify exact positions of UI elements (buttons, text fields, icons)
-                2. Use the VISIBLE coordinates from the screenshot for all tap/click actions
-                3. The screen resolution is 1080x2340. Estimate x,y coordinates based on where elements appear in the image
+                When a screenshot is attached to the screen state:
+                1. LOOK at the screenshot to identify exact positions of UI elements
+                2. Use the VISIBLE coordinates from the screenshot for all tap actions
+                3. The screen resolution is provided in the screen state — use it to estimate x,y coordinates
                 4. DO NOT guess coordinates from memory — always derive them from the screenshot
-                5. If the screenshot shows a different screen than expected, adjust your plan accordingly
-                6. Common WhatsApp elements:
-                - Search icon: usually top-right area, look for magnifying glass icon
-                - Message input: bottom of chat screen, look for "Type a message" text field
-                - Send button: right side of message input field, look for arrow/send icon
-                - Chat list items: middle of screen, each chat takes about 80px height
-                7. When you see the UI Tree alongside the screenshot, cross-reference both:
-                - UI Tree gives exact bounds like @(x,y) — USE THESE when available
-                - Screenshot confirms what's actually visible on screen
+                5. If the screenshot shows a different screen than expected, adjust your plan
+                6. When the UI Tree has @(x,y) coordinates, USE THOSE — they are exact
+                7. Cross-reference the screenshot with the UI Tree for best accuracy
+                8. For elements without UI Tree coordinates, estimate from their visual position in the screenshot
                 "#
             );
         }
@@ -281,7 +276,7 @@ impl Brain {
             "openai_compatible" | "llamacpp" => {
                 self.openai_compat(system_prompt, user_prompt, image_base64).await
             }
-            "codex_oauth" => {
+            "codex" => {
                 self.codex_oauth(system_prompt, user_prompt, image_base64).await
             }
             other => anyhow::bail!("Unknown backend: {}", other),

@@ -2,12 +2,14 @@ use crate::action::ActionExecutor;
 use crate::perception::{AndroidMessage, Perception};
 use crate::session::SessionManager;
 use crate::soul::Workspace;
+use crate::tailscale::TailscaleManager;
 use axum::{
     extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, State},
     response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
+use serde_json::{json, Value};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
@@ -22,6 +24,7 @@ pub struct AppState {
     pub sessions: Arc<SessionManager>,
     pub running: Arc<Mutex<bool>>,
     pub event_tx: broadcast::Sender<String>,
+    pub tailscale: Arc<Mutex<TailscaleManager>>,
 }
 
 #[derive(Serialize)]
@@ -69,6 +72,10 @@ pub fn build_router(state: AppState) -> Router {
         // WebSocket
         .route("/ws/android", get(ws_android))
         .route("/ws/user", get(ws_user))
+        .route("/tailscale/status", get(tailscale_status))
+        .route("/tailscale/connect", post(tailscale_connect))
+        .route("/tailscale/disconnect", post(tailscale_disconnect))
+        .route("/tailscale/peers", get(tailscale_peers))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -511,4 +518,30 @@ async fn handle_user(mut socket: WebSocket, state: AppState) {
             }
         }
     }
+}
+
+// ---- Tailscale handlers ----
+
+async fn tailscale_status(State(state): State<AppState>) -> Json<Value> {
+    let ts = state.tailscale.lock().await;
+    Json(json!({"ok": true, "data": ts.api_status()}))
+}
+
+async fn tailscale_connect(State(state): State<AppState>) -> Json<Value> {
+    let mut ts = state.tailscale.lock().await;
+    match ts.connect() {
+        Ok(addr) => Json(json!({"ok": true, "data": {"address": addr}})),
+        Err(e) => Json(json!({"ok": false, "error": e})),
+    }
+}
+
+async fn tailscale_disconnect(State(state): State<AppState>) -> Json<Value> {
+    let mut ts = state.tailscale.lock().await;
+    ts.disconnect();
+    Json(json!({"ok": true}))
+}
+
+async fn tailscale_peers(State(state): State<AppState>) -> Json<Value> {
+    let peers = TailscaleManager::list_peers(true);
+    Json(json!({"ok": true, "data": peers}))
 }

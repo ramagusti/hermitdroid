@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::path::Path;
+use crate::tailscale::TailscaleConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -12,6 +13,8 @@ pub struct Config {
     pub cron: Vec<CronJob>,
     #[serde(default)]
     pub hooks: HooksConfig,
+    #[serde(default)]
+    pub tailscale: TailscaleConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]

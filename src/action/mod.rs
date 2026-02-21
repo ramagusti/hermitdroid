@@ -171,6 +171,46 @@ impl ActionExecutor {
         });
     }
 
+    /// Wait for the screen to settle after an action.
+    /// Polls the foreground activity — if it changes, the UI transitioned.
+    /// Returns early if transition detected, otherwise waits max_ms.
+    async fn wait_for_settle(&self, max_ms: u64) {
+        // Get current foreground app
+        let before = self.adb(&["shell", "dumpsys", "activity", "activities"])
+            .ok()
+            .and_then(|raw| {
+                raw.lines()
+                    .find(|l| l.contains("mResumedActivity:") || l.contains("topResumedActivity:"))
+                    .map(|l| l.to_string())
+            })
+            .unwrap_or_default();
+
+        // Poll in 50ms intervals until screen changes or timeout
+        let start = std::time::Instant::now();
+        let interval = 50;
+        let checks = (max_ms / interval).max(1);
+
+        for _ in 0..checks {
+            tokio::time::sleep(tokio::time::Duration::from_millis(interval)).await;
+
+            let after = self.adb(&["shell", "dumpsys", "activity", "activities"])
+                .ok()
+                .and_then(|raw| {
+                    raw.lines()
+                        .find(|l| l.contains("mResumedActivity:") || l.contains("topResumedActivity:"))
+                        .map(|l| l.to_string())
+                })
+                .unwrap_or_default();
+
+            if after != before {
+                // Activity changed — UI transitioned, done waiting
+                tracing::debug!("Screen settled in {}ms (activity changed)", start.elapsed().as_millis());
+                return;
+            }
+        }
+        tracing::debug!("Screen settle timeout after {}ms", start.elapsed().as_millis());
+    }
+
     /// Route action to the correct executor
     async fn do_action(&self, action: &AgentAction, id: &str) -> anyhow::Result<String> {
         let p = &action.params;
@@ -180,8 +220,8 @@ impl ActionExecutor {
                 let result = self.adb(&["shell", "input", "tap",
                     &p["x"].as_f64().unwrap_or(0.0).to_string(),
                     &p["y"].as_f64().unwrap_or(0.0).to_string()]);
-                // Auto-settle: wait 500ms after every tap for UI animations/keyboard
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                // Reactive settle: wait until screen changes or 200ms max
+                self.wait_for_settle(200).await;
                 result
             }
 
@@ -206,9 +246,9 @@ impl ActionExecutor {
                     .unwrap_or(300).to_string()]),
 
             // --- Text input ---
-            // Auto-settle: wait 300ms before typing to let keyboard appear
             "type_text" => {
-                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                // Brief settle to ensure field is focused
+                self.wait_for_settle(150).await;
                 let text = p["text"].as_str().unwrap_or("");
                 if text.is_empty() {
                     return Ok("type_text: empty text, skipped".into());
@@ -254,8 +294,8 @@ impl ActionExecutor {
             "launch_app" => {
                 let pkg = p["package"].as_str().unwrap_or("");
                 let result = self.adb(&["shell", "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"]);
-                // Auto-settle: wait 1500ms for app to fully launch
-                tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+                // Reactive settle: wait for app to load (up to 800ms)
+                self.wait_for_settle(800).await;
                 result
             }
 
