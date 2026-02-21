@@ -1,24 +1,12 @@
-// src/main.rs — Modified with Tailscale + Onboarding integration
-//
-// CHANGES from your original (search for "// NEW:" comments):
-//   1. Added `mod onboarding;` and `mod tailscale;`
-//   2. Renamed SubCommand::Onboard → runs the interactive wizard
-//   3. Added SubCommand::Setup as alias
-//   4. Tailscale initialization before gateway start
-//   5. Tailscale health loop spawned alongside heartbeat
-//   6. ADB device target resolved from Tailscale when enabled
-//   7. Tailscale status in doctor output
-//   8. Auto-onboard when no config.toml exists
-
 mod action;
 mod brain;
 mod config;
-mod onboarding;   // NEW: interactive setup wizard
+mod onboarding;
 mod perception;
 mod server;
 mod session;
 mod soul;
-mod tailscale;    // NEW: Tailscale remote ADB
+mod tailscale;
 
 use crate::action::ActionExecutor;
 use crate::brain::Brain;
@@ -27,7 +15,7 @@ use crate::perception::Perception;
 use crate::server::{build_router, AppState};
 use crate::session::SessionManager;
 use crate::soul::Workspace;
-use crate::tailscale::TailscaleManager;  // NEW
+use crate::tailscale::TailscaleManager;
 use clap::Parser;
 use std::path::Path;
 use std::sync::Arc;
@@ -125,13 +113,11 @@ async fn main() -> anyhow::Result<()> {
         _ => {}
     }
 
-    // NEW: Handle `onboard` subcommand — runs before config load
     if matches!(cli.command, Some(SubCommand::Onboard)) {
         return onboarding::run_onboarding(Path::new(&cli.config))
             .map_err(Into::into);
     }
 
-    // NEW: Auto-trigger onboarding if no config file exists
     let config_path = Path::new(&cli.config);
     if !config_path.exists() {
         println!();
@@ -167,7 +153,6 @@ async fn main() -> anyhow::Result<()> {
                         println!("   Pending: {} action(s) awaiting confirmation", pending);
                     }
                     println!("   Dashboard: http://localhost:{}", config.server.port);
-                    // NEW: Show Tailscale status
                     if config.tailscale.enabled {
                         let ts_ip = TailscaleManager::get_self_ip().unwrap_or_else(|| "unknown".into());
                         println!("   Tailscale: 🌐 {} → {}", config.tailscale.phone_hostname, ts_ip);
@@ -247,10 +232,6 @@ async fn main() -> anyhow::Result<()> {
     info!("🤖 Hermitdroid v{}", env!("CARGO_PKG_VERSION"));
     info!("Agent: {} | Model: {} | Backend: {}", config.agent.name, config.brain.model, config.brain.backend);
 
-    // ── NEW: Tailscale initialization ────────────────────────────────────
-    // Resolves the effective ADB device address. If Tailscale is enabled and
-    // connects successfully, it overrides perception.adb_device with the
-    // Tailscale IP:port. Otherwise falls back to the config value.
     let tailscale_manager = Arc::new(Mutex::new(TailscaleManager::new(config.tailscale.clone())));
     let effective_adb_device: String;
 
@@ -290,7 +271,6 @@ async fn main() -> anyhow::Result<()> {
     let workspace = Arc::new(Workspace::new(&config.agent.workspace_path, config.agent.bootstrap_max_chars));
     let brain = Arc::new(Brain::new(&config.brain));
 
-    // NEW: Use effective_adb_device (Tailscale or local) instead of raw config
     let perception_adb: Option<String> = if effective_adb_device.is_empty() {
         config.perception.adb_device.clone()
     } else {
@@ -350,13 +330,9 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let router = build_router(state);
 
-    // NEW: Add Tailscale API routes if you want them.
-    // See the "Adding Tailscale API routes" section at the bottom of this file.
-
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("🌐 Dashboard: http://localhost:{}", config.server.port);
 
-    // NEW: Show Tailscale remote URL
     if config.tailscale.enabled {
         if let Some(ts_ip) = TailscaleManager::get_self_ip() {
             info!("🌐 Remote dashboard: http://{}:{}", ts_ip, config.server.port);
@@ -727,7 +703,6 @@ fn run_doctor(config: &Config) -> anyhow::Result<()> {
         Err(_) => println!("❌ ADB: not found in PATH"),
     }
 
-    // NEW: Tailscale check
     if config.tailscale.enabled {
         println!();
         println!("🌐 Tailscale:");
