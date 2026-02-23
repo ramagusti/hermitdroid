@@ -1,0 +1,20 @@
+{
+  "name": "Price Comparison",
+  "description": "Compare prices across shopping apps",
+  "steps": [
+    {
+      "app": "com.tokopedia.tkpd",
+      "goal": "Search for the product and note the top 3 prices",
+      "form_data": {
+        "product": "USB-C cable 2m"
+      }
+    },
+    {
+      "app": "com.shopee.id",
+      "goal": "Search for the same product and note the top 3 prices",
+      "form_data": {
+        "product": "USB-C cable 2m"
+      }
+    }
+  ]
+}

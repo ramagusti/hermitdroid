@@ -1,0 +1,6 @@
+name: Go Home
+description: Press home button and wait
+---
+- home
+- wait: 0.5
+- done: "At home screen"

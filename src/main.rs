@@ -2,16 +2,23 @@ mod action;
 mod brain;
 mod config;
 mod onboarding;
+mod oneshot;
+mod workflow;
+mod flow;
 mod perception;
+mod sanitizer;
 mod server;
 mod session;
 mod soul;
 mod tailscale;
+mod stuck;
+mod fallback;
 
 use crate::action::ActionExecutor;
 use crate::brain::Brain;
 use crate::config::Config;
 use crate::perception::Perception;
+use crate::sanitizer::VisionMode;
 use crate::server::{build_router, AppState};
 use crate::session::SessionManager;
 use crate::soul::Workspace;
@@ -48,6 +55,20 @@ enum SubCommand {
     Onboard,
     /// Check workspace and config health
     Doctor,
+    /// Run a one-shot goal (no daemon needed)
+    Run {
+        /// The goal in plain English (e.g. "open youtube and search lofi")
+        goal: Vec<String>,
+        /// Maximum steps before giving up
+        #[arg(long, default_value_t = 30)]
+        max_steps: u32,
+        /// Show LLM thinking in real-time
+        #[arg(long, short)]
+        verbose: bool,
+        /// Save this goal as a reusable workflow
+        #[arg(long)]
+        save_as: Option<String>,
+    },
     /// Install/uninstall as a background service (systemd)
     Service {
         #[command(subcommand)]
@@ -55,6 +76,21 @@ enum SubCommand {
     },
     /// Show real-time agent logs
     Logs,
+    /// Run an AI-powered workflow (multi-step JSON)
+    Workflow {
+        /// Path to workflow JSON file
+        path: String,
+        /// Show LLM thinking in real-time
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Run a deterministic flow (YAML, no AI, instant)
+    Flow {
+        /// Path to flow YAML file
+        path: String,
+    },
+    /// List available workflows and flows
+    Workflows,
     /// Stop a running background agent
     Stop,
     /// Restart the background agent
@@ -93,6 +129,14 @@ fn default_config_path() -> String {
     } else {
         "config.toml".to_string()
     }
+}
+
+/// Fast hash for screen change detection (not cryptographic, just for comparison)
+fn simple_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[tokio::main]
@@ -134,6 +178,40 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = Config::load(Path::new(&cli.config))?;
+
+    // This is placed early because `run` should be lightweight and fast.
+    // No need to check for a running instance or start a server.
+    if let Some(SubCommand::Run {
+        goal,
+        max_steps,
+        verbose,
+        save_as,
+    }) = &cli.command
+    {
+        let goal_text = goal.join(" ");
+        if goal_text.is_empty() {
+            println!("Usage: hermitdroid run \"your goal here\"");
+            println!();
+            println!("Examples:");
+            println!("  hermitdroid run \"open youtube and search for lofi\"");
+            println!("  hermitdroid run --verbose \"check my gmail inbox\"");
+            println!("  hermitdroid run --max-steps 10 \"turn on wifi\"");
+            println!("  hermitdroid run --dry-run \"send hi to Mom on whatsapp\"");
+            println!("  hermitdroid run \"open settings\" --save-as check-settings");
+            return Ok(());
+        }
+
+        // If --save-as is specified, save as a workflow first
+        if let Some(ref name) = save_as {
+            workflow::save_goal_as_workflow(
+                &config.agent.workspace_path,
+                name,
+                &goal_text,
+                None, // no specific app
+            )?;
+        }
+        return oneshot::run_oneshot(&config, &goal_text, *max_steps, *verbose, cli.dry_run).await;
+    }
 
     match cli.command {
         Some(SubCommand::Status) => {
@@ -199,6 +277,42 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Some(SubCommand::Workflow { path, verbose }) => {
+            return workflow::run_workflow(&config, &path, verbose, cli.dry_run).await;
+        }
+        Some(SubCommand::Flow { path }) => {
+            return flow::run_flow(&config, &path, cli.dry_run).await;
+        }
+        Some(SubCommand::Workflows) => {
+            println!("\n\x1b[1m📋 Available Workflows (AI-powered)\x1b[0m\n");
+            let workflows = workflow::list_workflows(&config.agent.workspace_path);
+            if workflows.is_empty() {
+                println!("  No workflows found. Check examples/workflows/");
+            } else {
+                for (path, w) in &workflows {
+                    println!("  \x1b[36m{}\x1b[0m", path.display());
+                    println!("    {} — {} step(s)", w.name, w.steps.len());
+                    if !w.description.is_empty() {
+                        println!("    \x1b[2m{}\x1b[0m", w.description);
+                    }
+                }
+            }
+            println!("\n\x1b[1m⚡ Available Flows (no AI, instant)\x1b[0m\n");
+            let flows = flow::list_flows();
+            if flows.is_empty() {
+                println!("  No flows found. Check examples/flows/");
+            } else {
+                for (path, f) in &flows {
+                    println!("  \x1b[36m{}\x1b[0m", path.display());
+                    println!("    {}", f.name);
+                    if let Some(ref desc) = f.description {
+                        println!("    \x1b[2m{}\x1b[0m", desc);
+                    }
+                }
+            }
+            println!();
+            return Ok(());
+        }
         Some(SubCommand::Stop) => {
             let url = format!("http://127.0.0.1:{}/stop", config.server.port);
             match reqwest::Client::new().post(&url)
@@ -222,6 +336,7 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Some(SubCommand::Run { .. }) => unreachable!(),
         _ => {} // Gateway (default)
     }
 
@@ -257,7 +372,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Spawn background health-check loop
         let ts_clone = tailscale_manager.clone();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let health_interval = config.tailscale.health_check_interval_secs;
         tokio::spawn(async move {
             tailscale::tailscale_health_loop(ts_clone, health_interval, shutdown_rx).await;
@@ -387,16 +502,33 @@ async fn main() -> anyhow::Result<()> {
             last_gateway_heartbeat = std::time::Instant::now();
         }
 
-        let result = heartbeat_tick(
-            &workspace, &brain, &perception, &executor, &sessions, &event_tx, tick_count,
-            &config.perception.bridge_mode,
-        ).await;
+        // let vision_mode = VisionMode::from_str(&config.perception.vision_mode);
+        // let perception_result = sanitizer::perceive_screen(
+        //     &config.perception.adb_device,
+        //     vision_mode,
+        //     config.perception.max_elements,
+        // ).await;
 
-        if let Err(e) = result {
+        // if let Err(e) = perception_result {
+        //     error!("Tick error: {}", e);
+        //     workspace.append_daily_memory(&format!("ERROR: {}", e)).ok();
+        // }
+
+        if let Err(e) = heartbeat_tick(
+            &config,
+            &workspace,
+            &brain,
+            &perception,
+            &executor,
+            &sessions,
+            &event_tx,
+            tick_count,
+            &config.perception.bridge_mode,
+        ).await {
             error!("Tick error: {}", e);
             workspace.append_daily_memory(&format!("ERROR: {}", e)).ok();
         }
-
+        
         tokio::select! {
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(heartbeat_interval)) => {}
             event = event_rx.recv() => {
@@ -415,8 +547,9 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Single heartbeat tick — the core agent loop (UNCHANGED from your original)
+/// Single heartbeat tick — the core agent loop
 async fn heartbeat_tick(
+    config: &Config,
     workspace: &Workspace,
     brain: &Brain,
     perception: &Perception,
@@ -440,14 +573,22 @@ async fn heartbeat_tick(
     // 1. Gather context
     let ctx = workspace.assemble_bootstrap();
     let notifications = perception.drain_notifications().await;
-    let screen = perception.get_screen_state().await;
+    // let screen = perception.get_screen_state().await;
+    let vision_mode = VisionMode::from_str(&config.perception.vision_mode);
+    let screen = Some(sanitizer::perceive_screen(
+        &config.perception.adb_device,
+        vision_mode,
+        config.perception.max_elements,
+    ).await);
     let commands = perception.drain_user_commands().await;
     let events = perception.drain_device_events().await;
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
 
     let notif_text = Perception::format_notifications(&notifications);
-    let resolution = perception.get_resolution().await;
-    let screen_text = Perception::format_screen_with_resolution(&screen, resolution);
+    let screen_text = screen
+        .as_ref()
+        .map(|s| s.formatted_text.clone())
+        .unwrap_or_else(|| "[No screen data available]".to_string());
 
     if notifications.is_empty() && commands.is_empty() && events.is_empty() && tick % 4 != 0 {
         tracing::debug!("Tick {}: idle (skipping LLM)", tick);
@@ -492,14 +633,27 @@ async fn heartbeat_tick(
         info!("💬 → User: {}", msg);
     }
 
-    // 9. Execute actions with screen re-polling
+    // ─────────────────────────────────────────────────────────────────
+    // 9. Execute actions with ADAPTIVE screen-aware pacing
+    //
+    // Instead of executing N actions then waiting 30s for next heartbeat:
+    //   • Execute each action with a short adaptive settle wait
+    //   • After 2+ UI actions, poll screen and check if it changed
+    //   • If changed → break for fresh LLM re-plan (immediate, not 30s)
+    //   • If unchanged → keep going without LLM overhead
+    //   • Non-UI actions (type_text, wait) execute with minimal delay
+    // ─────────────────────────────────────────────────────────────────
     if response.actions.is_empty() {
         tracing::debug!("Tick {}: no actions", tick);
     } else {
         info!("Tick {}: {} action(s)", tick, response.actions.len());
 
-        let ui_changing_actions = ["tap", "launch_app", "long_press", "swipe", "back", "home"];
-        let mut ui_changed_count = 0;
+        // Categorize actions by how much they change the UI
+        let heavy_ui = ["launch_app", "back", "home"];      // App transitions, ~800ms settle
+        let light_ui = ["tap", "long_press", "swipe"];       // In-app interaction, ~300ms settle
+
+        let mut consecutive_ui_actions = 0;
+        let mut last_screen_hash: u64 = simple_hash(&screen_text);
 
         for (i, action) in response.actions.iter().enumerate() {
             match executor.execute(action).await {
@@ -515,28 +669,70 @@ async fn heartbeat_tick(
                         "result": result,
                     }).to_string());
 
-                    if ui_changing_actions.contains(&action.action_type.as_str()) {
-                        ui_changed_count += 1;
-                    }
+                    let is_heavy = heavy_ui.contains(&action.action_type.as_str());
+                    let is_light = light_ui.contains(&action.action_type.as_str());
 
-                    if ui_changed_count >= 3 && i + 1 < response.actions.len() {
-                        let remaining = response.actions.len() - i - 1;
-                        info!("  ⏸ Pausing after {} UI actions — {} remaining, will re-poll screen", ui_changed_count, remaining);
+                    if is_heavy || is_light {
+                        consecutive_ui_actions += 1;
 
-                        if bridge_mode == "adb" {
+                        // Adaptive settle: wait just long enough for the UI to update
+                        let settle_ms = if is_heavy { 800 } else { 300 };
+                        tokio::time::sleep(tokio::time::Duration::from_millis(settle_ms)).await;
+
+                        // After 2+ UI actions with more remaining, check if screen changed
+                        if consecutive_ui_actions >= 2 && i + 1 < response.actions.len() && bridge_mode == "adb" {
+                            // Quick screen poll
                             perception.poll_screen_adb_full(true).await;
-                        }
+                            // let new_screen = perception.get_screen_state().await;
+                            let vision_mode = VisionMode::from_str(&config.perception.vision_mode);
+                            let new_screen = Some(sanitizer::perceive_screen(
+                                &config.perception.adb_device,
+                                vision_mode,
+                                config.perception.max_elements,
+                            ).await);
+                            let new_screen_text = new_screen
+                                .as_ref()
+                                .map(|s| s.formatted_text.clone())
+                                .unwrap_or_else(|| "[No screen data available]".to_string());
+                            let new_hash = simple_hash(&new_screen_text);
 
-                        let remaining_descriptions: Vec<String> = response.actions[i+1..]
-                            .iter()
-                            .map(|a| format!("{}: {}", a.action_type, a.reason))
-                            .collect();
-                        let continuation = format!(
-                            "[CONTINUE] Previous actions paused for screen refresh. Remaining steps: {}",
-                            remaining_descriptions.join("; ")
-                        );
-                        perception.push_user_command(continuation).await;
-                        break;
+                            if new_hash != last_screen_hash {
+                                // Screen changed → break for LLM re-plan with fresh screen data
+                                let remaining = response.actions.len() - i - 1;
+                                info!("  🔄 Screen changed after {} actions — re-planning {} remaining",
+                                    consecutive_ui_actions, remaining);
+
+                                let remaining_descriptions: Vec<String> = response.actions[i+1..]
+                                    .iter()
+                                    .map(|a| format!("{}: {}", a.action_type, a.reason))
+                                    .collect();
+                                let continuation = format!(
+                                    "[CONTINUE] Screen updated after actions. Remaining goals: {}. \
+                                     Check current screen and adjust coordinates/approach if needed.",
+                                    remaining_descriptions.join("; ")
+                                );
+                                perception.push_user_command(continuation).await;
+
+                                // Wake up the heartbeat loop IMMEDIATELY (not after 30s)
+                                let _ = event_tx.send(serde_json::json!({
+                                    "type": "user_command", "event": "continuation"
+                                }).to_string());
+                                break;
+                            } else {
+                                // Screen didn't change — safe to keep executing
+                                tracing::debug!("  Screen unchanged after {} actions, continuing...", consecutive_ui_actions);
+                                last_screen_hash = new_hash;
+
+                                // Safety valve: if many actions without screen change, something may be stuck
+                                if consecutive_ui_actions >= 6 {
+                                    warn!("  ⚠ {} UI actions without screen change — possible stuck state", consecutive_ui_actions);
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        // Non-UI action (type_text, wait, etc.) — minimal delay, no screen check
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                     }
                 }
                 Err(e) => {
@@ -544,6 +740,11 @@ async fn heartbeat_tick(
                     workspace.append_daily_memory(&format!(
                         "FAILED: {} → {}", action.action_type, e
                     )).ok();
+                    // Don't continue blindly after a failure
+                    if i + 1 < response.actions.len() {
+                        warn!("  Aborting remaining {} actions after failure", response.actions.len() - i - 1);
+                        break;
+                    }
                 }
             }
         }
@@ -563,7 +764,7 @@ async fn heartbeat_tick(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Service management (systemd --user) — UNCHANGED
+// Service management (systemd --user)
 // ════════════════════════════════════════════════════════════════════════════
 
 fn handle_service(action: &ServiceAction) -> anyhow::Result<()> {

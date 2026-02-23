@@ -1,0 +1,14 @@
+{
+  "name": "Send Telegram Message",
+  "description": "Send a message via Telegram",
+  "steps": [
+    {
+      "app": "org.telegram.messenger",
+      "goal": "Search for the contact and send them the message",
+      "form_data": {
+        "contact": "Alex",
+        "message": "Meeting still at 3pm?"
+      }
+    }
+  ]
+}

@@ -1,9 +1,3 @@
-// src/tailscale.rs — Tailscale integration for remote ADB access
-//
-// Resolves phone on tailnet, connects ADB over WireGuard tunnel,
-// monitors health, auto-reconnects. Integrates with existing
-// perception.adb_device and action executor device targets.
-
 use std::net::TcpStream;
 use std::process::Command;
 use std::sync::Arc;

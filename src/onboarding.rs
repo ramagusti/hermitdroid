@@ -1,13 +1,3 @@
-// src/onboarding.rs — Interactive first-run onboarding wizard
-//
-// Runs as `hermitdroid onboard`. Walks user through:
-//   1. AI provider / model / endpoint / API key
-//   2. Vision (screen sharing) toggle
-//   3. ADB connection (USB or Wi-Fi)
-//   4. Tailscale remote access (optional, only if ADB set up)
-//
-// Generates a config.toml that matches the existing Config struct layout.
-
 use std::io::{self, BufRead, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -95,12 +85,22 @@ struct BrainResult {
     endpoint: String,
     api_key: Option<String>,
     vision_enabled: bool,
+    fallback: Option<FallbackResult>,
+}
+
+struct FallbackResult {
+    backend: String,
+    model: String,
+    endpoint: String,
+    api_key: String,
+    vision_enabled: bool,
 }
 
 fn step_ai_and_vision() -> BrainResult {
     println!("\n{CYAN}━━━ Step 1/4: AI Provider & Model ━━━{RESET}\n");
-
+    
     let providers = &[
+        ("Groq (cloud)", "★ FREE tier — blazing fast, no credit card needed."),
         ("Ollama (local)", "Free, runs on your machine. No API key needed."),
         ("OpenAI", "GPT-4o, GPT-4o-mini, etc. Requires API key."),
         ("OpenAI Codex", "Uses `codex` CLI login. No API key needed."),
@@ -112,14 +112,15 @@ fn step_ai_and_vision() -> BrainResult {
 
     let choice = prompt_choice("Which AI provider will you use?", providers);
 
-    let (backend, default_endpoint, needs_key, is_codex) = match choice {
-        0 => ("ollama", "http://localhost:11434", false, false),
-        1 => ("openai_compatible", "https://api.openai.com/v1", true, false),
-        2 => ("codex", "https://chatgpt.com/backend-api/codex/responses", false, true),
-        3 => ("openai_compatible", "https://api.anthropic.com", true, false),
-        4 => ("google", "https://generativelanguage.googleapis.com/v1beta", true, false),
-        5 => ("openai_compatible", "http://localhost:8000/v1", false, false),
-        6 => ("openai_compatible", "", false, false),
+    let (backend, default_endpoint, needs_key, is_codex, is_groq) = match choice {
+        0 => ("groq", "https://api.groq.com/openai/v1", true, false, true),
+        1 => ("ollama", "http://localhost:11434", false, false, false),
+        2 => ("openai_compatible", "https://api.openai.com/v1", true, false, false),
+        3 => ("codex", "https://chatgpt.com/backend-api/codex/responses", false, true, false),
+        4 => ("openai_compatible", "https://api.anthropic.com", true, false, false),
+        5 => ("openai_compatible", "https://generativelanguage.googleapis.com/v1beta", true, false, false),
+        6 => ("openai_compatible", "http://localhost:8000/v1", false, false, false),
+        7 => ("openai_compatible", "", false, false, false),
         _ => unreachable!(),
     };
 
@@ -163,16 +164,40 @@ fn step_ai_and_vision() -> BrainResult {
         }
     }
 
+    if is_groq {
+        println!("\n  {BOLD}🚀 Groq Setup{RESET}\n");
+        println!("  Groq provides blazing-fast inference with a free tier.");
+        println!("  No credit card required.\n");
+        println!("  {BOLD}To get your API key:{RESET}");
+        println!("  ┌─────────────────────────────────────────────────────────┐");
+        println!("  │  1. Go to  {CYAN}https://console.groq.com{RESET}                    │");
+        println!("  │  2. Sign up with Google or GitHub (free)               │");
+        println!("  │  3. Click {BOLD}Developers{RESET} → {BOLD}API Keys{RESET} in the sidebar          │");
+        println!("  │  4. Click {BOLD}Create API Key{RESET}                               │");
+        println!("  │  5. Copy the key (starts with {DIM}gsk_{RESET})                    │");
+        println!("  └─────────────────────────────────────────────────────────┘");
+        println!();
+    }
+
     let default_model = match choice {
-        0 => "yeahdongcn/AutoGLM-Phone-9B",
-        1 => "gpt-4o",
-        2 => "codex-mini",
-        3 => "claude-sonnet-4-20250514",
-        4 => "gemini-2.0-flash",
+        0 => "llama-3.3-70b-versatile",        // Groq
+        1 => "yeahdongcn/AutoGLM-Phone-9B",    // Ollama
+        2 => "gpt-4o",                         // OpenAI
+        3 => "gpt-5.1-codex-mini",             // Codex
+        4 => "claude-sonnet-4-20250514",       // Anthropic
+        5 => "gemini-2.5-flash",               // Gemini
         _ => "default",
     };
 
-    if choice == 0 {
+    if is_groq {
+        println!("\n  {DIM}Groq models for Android control:{RESET}");
+        println!("    • llama-3.3-70b-versatile         {DIM}(recommended — best balance){RESET}");
+        println!("    • llama-3.1-8b-instant            {DIM}(faster, lighter){RESET}");
+        println!("    • deepseek-r1-distill-llama-70b   {DIM}(reasoning focused){RESET}");
+        println!("    • gemma2-9b-it                    {DIM}(good for simple tasks){RESET}");
+    }
+
+    if choice == 1 {
         println!("\n  {DIM}Popular Ollama models for Android control:{RESET}");
         println!("    • yeahdongcn/AutoGLM-Phone-9B {DIM}(phone UI specialist, recommended){RESET}");
         println!("    • qwen2.5-vl:7b               {DIM}(vision + reasoning){RESET}");
@@ -204,7 +229,14 @@ fn step_ai_and_vision() -> BrainResult {
         if key.is_empty() {
             println!("  {YELLOW}⚠  No key. Set later in config.toml or HERMITDROID_API_KEY env.{RESET}");
             None
-        } else { Some(key) }
+        } else {
+            // Validate key format for known providers
+            if is_groq && !key.starts_with("gsk_") {
+                println!("  {YELLOW}⚠  Key doesn't look like a Groq key (should start with gsk_).{RESET}");
+                println!("     Continuing anyway — you can fix it in config.toml later.");
+            }
+            Some(key)
+        }
     } else {
         let want = prompt_yes_no("  Set an API key? (some local servers need auth)", false);
         if want { let k = prompt("  API key:"); if k.is_empty() { None } else { Some(k) } }
@@ -226,8 +258,100 @@ fn step_ai_and_vision() -> BrainResult {
             format!("{YELLOW}✓  Vision disabled. Text-only context.{RESET}")
         }
     );
+    // ── Fallback Model ──────────────────────────────────────────────
+    println!("\n{CYAN}━━━ Fallback Model (optional) ━━━{RESET}\n");
+    println!("  If your primary model hits rate limits or goes down,");
+    println!("  Hermitdroid can automatically switch to a backup.\n");
 
-    BrainResult { backend: backend.into(), model, endpoint, api_key, vision_enabled }
+    let fallback_options: Vec<(&str, &str)> = if backend == "groq" {
+        // Primary is Groq — don't offer Groq as fallback
+        vec![
+            ("Skip", "No fallback (can add later)"),
+            ("Ollama (local)", "Free, runs on your machine"),
+            ("Other", "Custom OpenAI-compatible endpoint"),
+        ]
+    } else {
+        vec![
+            ("Skip", "No fallback (can add later)"),
+            ("Groq (cloud)", "★ Free tier — recommended safety net"),
+            ("Ollama (local)", "Free, runs on your machine"),
+            ("Other", "Custom OpenAI-compatible endpoint"),
+        ]
+    };
+
+    let fb_choice = prompt_choice("Set up a fallback model?", &fallback_options);
+
+    let fallback = if backend == "groq" {
+        match fb_choice {
+            1 => Some(FallbackResult {
+                backend: "ollama".into(),
+                model: "llama3.2".into(),
+                endpoint: "http://localhost:11434/v1".into(),
+                api_key: String::new(),
+                vision_enabled: false,
+            }),
+            2 => {
+                let ep = prompt("  Fallback endpoint:");
+                let m = prompt("  Fallback model:");
+                let k = prompt("  API key (or empty):");
+                Some(FallbackResult {
+                    backend: "openai_compatible".into(),
+                    model: m,
+                    endpoint: ep,
+                    api_key: k,
+                    vision_enabled: false,
+                })
+            }
+            _ => None,
+        }
+    } else {
+        match fb_choice {
+            1 => {
+                // Groq as fallback
+                println!();
+                println!("  {BOLD}Groq fallback setup:{RESET}");
+                println!("  If you already have a key, paste it. Otherwise:");
+                println!("  → {CYAN}https://console.groq.com{RESET} → Sign up → Developers → API Keys\n");
+
+                let fb_key = prompt("  Groq API key (gsk_..., or empty to skip):");
+                if fb_key.is_empty() {
+                    println!("  Skipped. Add later to config.toml under [[brain.fallbacks]].\n");
+                    None
+                } else {
+                    println!("  {GREEN}✓  Groq configured as fallback.{RESET}\n");
+                    Some(FallbackResult {
+                        backend: "groq".into(),
+                        model: "llama-3.3-70b-versatile".into(),
+                        endpoint: "https://api.groq.com/openai/v1".into(),
+                        api_key: fb_key,
+                        vision_enabled: false,
+                    })
+                }
+            }
+            2 => Some(FallbackResult {
+                backend: "ollama".into(),
+                model: "llama3.2".into(),
+                endpoint: "http://localhost:11434/v1".into(),
+                api_key: String::new(),
+                vision_enabled: false,
+            }),
+            3 => {
+                let ep = prompt("  Fallback endpoint:");
+                let m = prompt("  Fallback model:");
+                let k = prompt("  API key (or empty):");
+                Some(FallbackResult {
+                    backend: "openai_compatible".into(),
+                    model: m,
+                    endpoint: ep,
+                    api_key: k,
+                    vision_enabled: false,
+                })
+            }
+            _ => None,
+        }
+    };
+
+    BrainResult { backend: backend.into(), model, endpoint, api_key, vision_enabled, fallback }
 }
 
 // ── Step 3: ADB ─────────────────────────────────────────────────────────────
@@ -515,6 +639,37 @@ fn generate_config(
     }
     c.push_str("\n");
 
+    // Fallback config
+    c.push_str("# Model fallback — automatic failover on rate limit / timeout\n");
+    c.push_str("fallback_on_rate_limit = true\n");
+    c.push_str("fallback_on_auth_error = true\n");
+    c.push_str("fallback_on_timeout = true\n");
+    c.push_str("fallback_cooldown_secs = 60\n");
+    c.push_str("\n");
+
+    if let Some(ref fb) = brain.fallback {
+        c.push_str("[[brain.fallbacks]]\n");
+        c.push_str(&format!("backend = \"{}\"\n", fb.backend));
+        c.push_str(&format!("model = \"{}\"\n", fb.model));
+        c.push_str(&format!("endpoint = \"{}\"\n", fb.endpoint));
+        if fb.api_key.is_empty() {
+            c.push_str("api_key = \"\"\n");
+        } else {
+            c.push_str(&format!("api_key = \"{}\"\n", fb.api_key));
+        }
+        c.push_str(&format!("vision_enabled = {}\n", fb.vision_enabled));
+        c.push_str("\n");
+    } else {
+        c.push_str("# No fallback model configured. To add one:\n");
+        c.push_str("# [[brain.fallbacks]]\n");
+        c.push_str("# backend = \"groq\"\n");
+        c.push_str("# model = \"llama-3.3-70b-versatile\"\n");
+        c.push_str("# endpoint = \"https://api.groq.com/openai/v1\"\n");
+        c.push_str("# api_key = \"gsk_your_key_here\"\n");
+        c.push_str("# vision_enabled = false\n");
+        c.push_str("\n");
+    }
+
     // [perception]
     c.push_str("[perception]\n");
     let bridge = adb.as_ref().map(|a| a.bridge_mode.as_str()).unwrap_or("adb");
@@ -576,6 +731,16 @@ fn generate_config(
     }
     c.push_str("\n");
 
+    // [stuck]
+    c.push_str("[stuck]\n");
+    c.push_str("# Stuck detection and recovery\n");
+    c.push_str("screen_threshold = 3\n");
+    c.push_str("repetition_window = 6\n");
+    c.push_str("repetition_threshold = 3\n");
+    c.push_str("drift_threshold = 5\n");
+    c.push_str("max_recovery_attempts = 3\n");
+    c.push_str("recovery_strategy = \"escalate\"\n\n");
+
     // [hooks]
     c.push_str("[hooks]\n");
     c.push_str("# on_boot = \"BOOT.md\"\n");
@@ -602,6 +767,11 @@ fn print_summary(
     println!("  {BOLD}AI Provider:{RESET}   {} / {}", brain.backend, brain.model);
     println!("  {BOLD}Endpoint:{RESET}      {}", brain.endpoint);
     println!("  {BOLD}Vision:{RESET}        {}", if brain.vision_enabled { "✓ Enabled" } else { "✗ Disabled" });
+    println!("  {BOLD}Fallback:{RESET}      {}",
+        brain.fallback.as_ref()
+            .map(|f| format!("✓ {} / {}", f.backend, f.model))
+            .unwrap_or_else(|| "None configured".into())
+    );
     println!("  {BOLD}ADB:{RESET}           {}",
         adb.as_ref().map(|a| {
             if a.adb_device.is_empty() { "USB (auto-detect)".into() }

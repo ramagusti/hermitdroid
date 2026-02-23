@@ -1,0 +1,10 @@
+{
+  "name": "Calendar Check",
+  "description": "Check today's and tomorrow's calendar events",
+  "steps": [
+    {
+      "app": "com.google.android.calendar",
+      "goal": "Open the calendar, look at today's and tomorrow's events, then say done with a summary"
+    }
+  ]
+}

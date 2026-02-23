@@ -1,0 +1,5 @@
+name: Take Screenshot
+description: Capture a screenshot of the current screen
+---
+- screenshot
+- done: "Screenshot saved"

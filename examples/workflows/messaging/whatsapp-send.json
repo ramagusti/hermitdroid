@@ -1,0 +1,14 @@
+{
+  "name": "Send WhatsApp Message",
+  "description": "Send a message to a specific WhatsApp contact",
+  "steps": [
+    {
+      "app": "com.whatsapp",
+      "goal": "Find the contact specified and send them the message",
+      "form_data": {
+        "contact": "Wife",
+        "message": "Hey! Just checking in"
+      }
+    }
+  ]
+}

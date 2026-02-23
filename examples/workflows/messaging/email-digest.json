@@ -1,0 +1,10 @@
+{
+  "name": "Email Digest",
+  "description": "Check Gmail for unread emails and summarize them",
+  "steps": [
+    {
+      "app": "com.google.android.gm",
+      "goal": "Open inbox, count unread emails, read the subject lines of the first 5 unread emails, then say done with a summary"
+    }
+  ]
+}

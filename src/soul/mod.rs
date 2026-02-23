@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Manages the workspace files — the agent's identity, memory, and configuration.
 /// Mirrors OpenClaw's workspace concept: SOUL.md, IDENTITY.md, AGENTS.md, TOOLS.md,

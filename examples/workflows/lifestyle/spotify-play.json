@@ -1,0 +1,13 @@
+{
+  "name": "Spotify Play",
+  "description": "Open Spotify and play music",
+  "steps": [
+    {
+      "app": "com.spotify.music",
+      "goal": "Search for the specified music and play it",
+      "form_data": {
+        "search": "lofi hip hop beats"
+      }
+    }
+  ]
+}

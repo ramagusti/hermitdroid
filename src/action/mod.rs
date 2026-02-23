@@ -57,6 +57,35 @@ impl ActionExecutor {
     pub fn outgoing(&self) -> Arc<Mutex<Vec<DeviceAction>>> { self.outgoing.clone() }
     pub fn action_log(&self) -> Arc<Mutex<Vec<ActionLogEntry>>> { self.action_log.clone() }
 
+    pub async fn execute_raw(&self, action_type: &str, adb_device: &Option<String>) -> anyhow::Result<String> {
+        if self.dry_run {
+            return Ok(format!("[dry-run] {}", action_type));
+        }
+
+        let mut cmd = std::process::Command::new("adb");
+        if let Some(dev) = adb_device {
+            cmd.args(["-s", dev]);
+        }
+        // If no specific device is set, check instance field
+        else if let Some(ref dev) = self.adb_device {
+            cmd.args(["-s", dev]);
+        }
+
+        match action_type {
+            "back" => { cmd.args(["shell", "input", "keyevent", "KEYCODE_BACK"]); }
+            "home" => { cmd.args(["shell", "input", "keyevent", "KEYCODE_HOME"]); }
+            "enter" => { cmd.args(["shell", "input", "keyevent", "KEYCODE_ENTER"]); }
+            other => anyhow::bail!("Unknown raw action: {}", other),
+        }
+
+        let out = cmd.output()?;
+        if out.status.success() {
+            Ok(format!("{} OK", action_type))
+        } else {
+            anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr))
+        }
+    }
+
     /// Execute an action with guardrail enforcement
     pub async fn execute(&self, action: &AgentAction) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string()[..8].to_string();

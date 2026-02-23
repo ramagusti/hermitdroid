@@ -1,0 +1,8 @@
+name: Clear All Notifications
+description: Pull down notification shade and clear everything
+---
+- swipe: [540, 50, 540, 800]
+- wait: 1.5
+- tap_text: "Clear all"
+- wait: 0.5
+- done: "Notifications cleared"

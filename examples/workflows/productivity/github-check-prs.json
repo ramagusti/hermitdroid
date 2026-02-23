@@ -1,0 +1,10 @@
+{
+  "name": "GitHub PR Check",
+  "description": "Check open pull requests on GitHub mobile",
+  "steps": [
+    {
+      "app": "com.github.android",
+      "goal": "Open the app, check notifications or pull requests that need review, report what you find"
+    }
+  ]
+}

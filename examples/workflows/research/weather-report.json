@@ -1,0 +1,13 @@
+{
+  "name": "Weather Report",
+  "description": "Search weather for a specific city",
+  "steps": [
+    {
+      "app": "com.google.android.googlequicksearchbox",
+      "goal": "Search for today's weather forecast for the specified city",
+      "form_data": {
+        "city": "Jakarta"
+      }
+    }
+  ]
+}

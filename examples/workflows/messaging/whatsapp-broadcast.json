@@ -1,0 +1,22 @@
+{
+  "name": "WhatsApp Broadcast",
+  "description": "Send a message to multiple WhatsApp contacts",
+  "steps": [
+    {
+      "app": "com.whatsapp",
+      "goal": "Find and open chat with the first contact, send them the message",
+      "form_data": {
+        "contact": "Mom",
+        "message": "Family dinner Sunday 6pm"
+      }
+    },
+    {
+      "app": "com.whatsapp",
+      "goal": "Find and open chat with the next contact, send them the message",
+      "form_data": {
+        "contact": "Dad",
+        "message": "Family dinner Sunday 6pm"
+      }
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+name: Open Recent Apps
+description: Show the recent apps switcher
+---
+- key: APP_SWITCH
+- wait: 0.5
+- done: "Recent apps shown"

@@ -1,0 +1,10 @@
+{
+  "name": "Notification Cleanup",
+  "description": "Clear and triage notifications",
+  "steps": [
+    {
+      "goal": "Pull down the notification shade, review all notifications, and clear them all",
+      "max_steps": 15
+    }
+  ]
+}

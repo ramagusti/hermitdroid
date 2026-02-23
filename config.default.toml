@@ -29,6 +29,8 @@ notifications_enabled = true
 accessibility_enabled = true
 # Apps whose notifications trigger immediate ticks
 priority_apps = ["whatsapp", "telegram", "gmail", "calendar"]
+vision_mode = "fallback"           # off | fallback | always
+max_elements = 50                  # max UI elements sent to LLM
 
 [action]
 dry_run = false

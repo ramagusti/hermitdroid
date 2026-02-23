@@ -1,9 +1,12 @@
 use crate::config::BrainConfig;
 use crate::soul::BootstrapContext;
+use crate::fallback::{FallbackManager, ModelConfig, FallbackConfig};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+// ── Codex OAuth types ───────────────────────────────────────────────────────
 
 /// Codex OAuth token data read from ~/.codex/auth.json
 #[derive(Debug, Clone, Deserialize)]
@@ -29,13 +32,19 @@ struct CachedCodexToken {
     loaded_at: std::time::Instant,
 }
 
+// ── Brain struct ────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct Brain {
     config: BrainConfig,
     client: reqwest::Client,
     /// Cached Codex OAuth token (reloaded from disk periodically)
     codex_token: Arc<RwLock<Option<CachedCodexToken>>>,
+    /// Model fallback manager (OpenClaw-inspired)
+    fallback_mgr: Arc<RwLock<Option<FallbackManager>>>,
 }
+
+// ── Response types ──────────────────────────────────────────────────────────
 
 /// Structured response from the LLM
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -60,6 +69,14 @@ pub struct AgentAction {
     pub classification: String,
     #[serde(default)]
     pub reason: String,
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub app: Option<String>,
 }
 
 fn default_green() -> String { "GREEN".into() }
@@ -68,30 +85,66 @@ fn default_green() -> String { "GREEN".into() }
 /// (Codex tokens refresh every ~8 minutes before expiry)
 const TOKEN_CACHE_SECS: u64 = 7 * 60;
 
+// ── impl Brain ──────────────────────────────────────────────────────────────
+
 impl Brain {
     pub fn new(config: &BrainConfig) -> Self {
-        let brain = Self {
+        // Build fallback manager if fallbacks are configured
+        let fallback_mgr = if !config.fallbacks.is_empty() {
+            let primary = ModelConfig {
+                backend: config.backend.clone(),
+                model: config.model.clone(),
+                endpoint: config.endpoint.clone(),
+                api_key: config.api_key.clone().unwrap_or_default(),
+                vision_enabled: config.vision_enabled,
+            };
+            let fallback_config = FallbackConfig {
+                fallback_on_rate_limit: config.fallback_on_rate_limit,
+                fallback_on_auth_error: config.fallback_on_auth_error,
+                fallback_on_timeout: config.fallback_on_timeout,
+                fallback_cooldown_secs: config.fallback_cooldown_secs,
+                fallbacks: config.fallbacks.clone(),
+            };
+            info!(
+                "🔄 Model fallback: {} fallback(s) configured",
+                config.fallbacks.len()
+            );
+            Some(FallbackManager::new(primary, fallback_config))
+        } else {
+            None
+        };
+
+        // Pre-load Codex token if needed
+        if config.backend == "codex" || config.backend == "codex_oauth" {
+            if let Some(_token) = Self::load_codex_token_from_disk(&config.codex_auth_path) {
+                info!(
+                    "🔑 Codex OAuth: token loaded from {}",
+                    config
+                        .codex_auth_path
+                        .as_deref()
+                        .unwrap_or("~/.codex/auth.json")
+                );
+            } else {
+                warn!("⚠️  Codex OAuth: no token found. Run `codex login`");
+            }
+        }
+
+        Self {
             config: config.clone(),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .unwrap_or_default(),
             codex_token: Arc::new(RwLock::new(None)),
-        };
-
-        // Pre-load token if backend is codex_oauth
-        if config.backend == "codex_oauth" {
-            if let Some(_token) = Self::load_codex_token_from_disk(&config.codex_auth_path) {
-                info!("🔑 Codex OAuth: token loaded from {}", config.codex_auth_path.as_deref().unwrap_or("~/.codex/auth.json"));
-            } else {
-                warn!("⚠️  Codex OAuth: no token found. Run `codex login` or `npm i -g @openai/codex && codex login`");
-            }
+            fallback_mgr: Arc::new(RwLock::new(fallback_mgr)),
         }
-
-        brain
     }
 
-    pub fn model_name(&self) -> &str { &self.config.model }
+    pub fn model_name(&self) -> &str {
+        &self.config.model
+    }
+
+    // ── Codex token management ──────────────────────────────────────────
 
     /// Load the Codex access token from ~/.codex/auth.json (or custom path)
     fn load_codex_token_from_disk(custom_path: &Option<String>) -> Option<String> {
@@ -153,9 +206,11 @@ impl Brain {
 
         // Reload from disk
         let token = Self::load_codex_token_from_disk(&self.config.codex_auth_path)
-            .ok_or_else(|| anyhow::anyhow!(
-                "No Codex OAuth token found. Run `codex login` to authenticate with ChatGPT."
-            ))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No Codex OAuth token found. Run `codex login` to authenticate with ChatGPT."
+                )
+            })?;
 
         // Update cache
         {
@@ -169,6 +224,8 @@ impl Brain {
         info!("🔑 Codex OAuth: token refreshed from disk");
         Ok(token)
     }
+
+    // ── Prompt builders ─────────────────────────────────────────────────
 
     /// Build the full system prompt from workspace bootstrap context
     pub fn build_system_prompt(&self, ctx: &BootstrapContext) -> String {
@@ -190,29 +247,39 @@ impl Brain {
             prompt.push_str(&format!("--- USER.md ---\n{}\n\n", ctx.user));
         }
         if !ctx.heartbeat.is_empty() {
-            prompt.push_str(&format!("--- HEARTBEAT.md ---\n{}\n\n", ctx.heartbeat));
+            prompt.push_str(&format!(
+                "--- HEARTBEAT.md ---\n{}\n\n",
+                ctx.heartbeat
+            ));
         }
         if let Some(bootstrap) = &ctx.bootstrap {
-            prompt.push_str(&format!("--- BOOTSTRAP.md (FIRST RUN) ---\n{}\n\n", bootstrap));
+            prompt.push_str(&format!(
+                "--- BOOTSTRAP.md (FIRST RUN) ---\n{}\n\n",
+                bootstrap
+            ));
         }
         for skill in &ctx.skills {
-            prompt.push_str(&format!("--- SKILL: {} ---\n{}\n\n", skill.name, skill.content));
+            prompt.push_str(&format!(
+                "--- SKILL: {} ---\n{}\n\n",
+                skill.name, skill.content
+            ));
         }
 
         // Vision instructions (when screenshots are enabled)
         if self.config.vision_enabled {
             prompt.push_str(
                 r#"--- VISION INSTRUCTIONS ---
-                When a screenshot is attached to the screen state:
-                1. LOOK at the screenshot to identify exact positions of UI elements
-                2. Use the VISIBLE coordinates from the screenshot for all tap actions
-                3. The screen resolution is provided in the screen state — use it to estimate x,y coordinates
-                4. DO NOT guess coordinates from memory — always derive them from the screenshot
-                5. If the screenshot shows a different screen than expected, adjust your plan
-                6. When the UI Tree has @(x,y) coordinates, USE THOSE — they are exact
-                7. Cross-reference the screenshot with the UI Tree for best accuracy
-                8. For elements without UI Tree coordinates, estimate from their visual position in the screenshot
-                "#
+When a screenshot is attached to the screen state:
+1. LOOK at the screenshot to identify exact positions of UI elements
+2. Use the VISIBLE coordinates from the screenshot for all tap actions
+3. The screen resolution is provided in the screen state — use it to estimate x,y coordinates
+4. DO NOT guess coordinates from memory — always derive them from the screenshot
+5. If the screenshot shows a different screen than expected, adjust your plan
+6. When the UI Tree has @(x,y) coordinates, USE THOSE — they are exact
+7. Cross-reference the screenshot with the UI Tree for best accuracy
+8. For elements without UI Tree coordinates, estimate from their visual position in the screenshot
+
+"#,
             );
         }
 
@@ -237,10 +304,16 @@ impl Brain {
         }
 
         if !ctx.memory.is_empty() {
-            prompt.push_str(&format!("--- Long-term Memory ---\n{}\n\n", ctx.memory));
+            prompt.push_str(&format!(
+                "--- Long-term Memory ---\n{}\n\n",
+                ctx.memory
+            ));
         }
 
-        prompt.push_str(&format!("--- New Notifications ---\n{}\n\n", notifications));
+        prompt.push_str(&format!(
+            "--- New Notifications ---\n{}\n\n",
+            notifications
+        ));
         prompt.push_str(&format!("--- Screen State ---\n{}\n\n", screen_state));
 
         if !user_commands.is_empty() {
@@ -251,7 +324,10 @@ impl Brain {
             prompt.push('\n');
         }
 
-        prompt.push_str("Evaluate the heartbeat checklist. Respond with your JSON action plan, or HEARTBEAT_OK if nothing needs attention.");
+        prompt.push_str(
+            "Evaluate the heartbeat checklist. Respond with your JSON action plan, \
+             or HEARTBEAT_OK if nothing needs attention.",
+        );
 
         prompt
     }
@@ -264,24 +340,137 @@ impl Brain {
         )
     }
 
-    /// Send prompt to LLM and get raw response
+    // ── LLM call with fallback ──────────────────────────────────────────
+
+    /// Send prompt to LLM and get raw response, with automatic fallback
     pub async fn think(
         &self,
         system_prompt: &str,
         user_prompt: &str,
         image_base64: Option<&str>,
     ) -> anyhow::Result<String> {
-        match self.config.backend.as_str() {
-            "ollama" => self.ollama(system_prompt, user_prompt, image_base64).await,
-            "openai_compatible" | "llamacpp" => {
-                self.openai_compat(system_prompt, user_prompt, image_base64).await
+        // Try primary model
+        match self
+            .call_backend(&self.config.backend, system_prompt, user_prompt, image_base64)
+            .await
+        {
+            Ok(response) => {
+                // Report success to fallback manager
+                if let Some(ref mut mgr) = *self.fallback_mgr.write().await {
+                    mgr.report_success();
+                }
+                Ok(response)
             }
-            "codex" => {
-                self.codex_oauth(system_prompt, user_prompt, image_base64).await
+            Err(e) => {
+                let error_str = e.to_string();
+
+                // Try fallback if available
+                let fallback_model = {
+                    let mut mgr_guard = self.fallback_mgr.write().await;
+                    if let Some(ref mut mgr) = *mgr_guard {
+                        mgr.report_failure(&error_str)
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(fb) = fallback_model {
+                    warn!(
+                        "Primary model failed ({}), trying fallback: {}/{}",
+                        error_str, fb.backend, fb.model
+                    );
+                    self.call_with_model_config(
+                        &fb,
+                        system_prompt,
+                        user_prompt,
+                        image_base64,
+                    )
+                    .await
+                } else {
+                    Err(e)
+                }
             }
-            other => anyhow::bail!("Unknown backend: {}", other),
         }
     }
+
+    /// Route to the correct backend by name
+    fn call_backend<'a>(
+        &'a self,
+        backend: &'a str,
+        system: &'a str,
+        user: &'a str,
+        image: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match backend {
+                "ollama" => self.ollama(system, user, image).await,
+                "groq" | "openai_compatible" | "llamacpp" => {
+                    self.openai_compat(system, user, image).await
+                }
+                "codex" | "codex_oauth" => self.codex_oauth(system, user, image).await,
+                other => anyhow::bail!("Unknown backend: {}", other),
+            }
+        })
+    }
+
+    /// Call a specific model config (used for fallback models)
+    async fn call_with_model_config(
+        &self,
+        model: &ModelConfig,
+        system: &str,
+        user: &str,
+        image: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let url = format!("{}/chat/completions", model.endpoint);
+
+        let user_content = if let Some(img) = image {
+            if model.vision_enabled {
+                serde_json::json!([
+                    {"type": "text", "text": user},
+                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", img)}}
+                ])
+            } else {
+                // Fallback doesn't support vision — send text only
+                serde_json::json!(user)
+            }
+        } else {
+            serde_json::json!(user)
+        };
+
+        let body = serde_json::json!({
+            "model": model.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content}
+            ],
+            "max_tokens": self.config.max_tokens,
+            "temperature": self.config.temperature,
+        });
+
+        let mut req = self.client.post(&url).json(&body);
+        if !model.api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", model.api_key));
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "Fallback LLM ({}/{}) error {}: {}",
+                model.backend,
+                model.model,
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        let result: serde_json::Value = resp.json().await?;
+        Ok(result["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string())
+    }
+
+    // ── Response parsing ────────────────────────────────────────────────
 
     /// Parse raw LLM text into structured AgentResponse
     pub fn parse_response(&self, raw: &str) -> AgentResponse {
@@ -323,7 +512,10 @@ impl Brain {
             }
         }
 
-        warn!("Could not parse any JSON from LLM response (len={})", trimmed.len());
+        warn!(
+            "Could not parse any JSON from LLM response (len={})",
+            trimmed.len()
+        );
         AgentResponse {
             reflection: Some(trimmed.chars().take(500).collect()),
             message: None,
@@ -337,21 +529,28 @@ impl Brain {
         }
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
             return Some(AgentResponse {
-                actions: val.get("actions")
+                actions: val
+                    .get("actions")
                     .and_then(|a| serde_json::from_value(a.clone()).ok())
                     .unwrap_or_default(),
-                reflection: val.get("reflection")
-                    .and_then(|v| v.as_str()).map(String::from),
-                message: val.get("message")
-                    .and_then(|v| v.as_str()).map(String::from),
-                memory_write: val.get("memory_write")
-                    .and_then(|v| v.as_str()).map(String::from),
+                reflection: val
+                    .get("reflection")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                message: val
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                memory_write: val
+                    .get("memory_write")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
             });
         }
         None
     }
 
-    // ---- Backend implementations ----
+    // ── Backend implementations ─────────────────────────────────────────
 
     async fn ollama(
         &self,
@@ -376,7 +575,11 @@ impl Brain {
 
         let resp = self.client.post(&url).json(&body).send().await?;
         if !resp.status().is_success() {
-            anyhow::bail!("Ollama error {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+            anyhow::bail!(
+                "Ollama error {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
         }
         let result: serde_json::Value = resp.json().await?;
         Ok(result["response"].as_str().unwrap_or("").to_string())
@@ -417,10 +620,17 @@ impl Brain {
 
         let resp = req.send().await?;
         if !resp.status().is_success() {
-            anyhow::bail!("LLM API error {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+            anyhow::bail!(
+                "LLM API error {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
         }
         let result: serde_json::Value = resp.json().await?;
-        Ok(result["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string())
+        Ok(result["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string())
     }
 
     /// Codex OAuth backend — uses the Responses API at chatgpt.com/backend-api/codex/responses
@@ -438,18 +648,16 @@ impl Brain {
         let url = "https://chatgpt.com/backend-api/codex/responses";
 
         // Build input array in OpenAI Responses API format
-        let mut input = vec![
-            serde_json::json!({
-                "type": "message",
-                "role": "developer",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": system
-                    }
-                ]
-            }),
-        ];
+        let mut input = vec![serde_json::json!({
+            "type": "message",
+            "role": "developer",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": system
+                }
+            ]
+        })];
 
         // User message — with optional image
         if let Some(img) = image {
@@ -495,7 +703,8 @@ impl Brain {
 
         debug!("Codex OAuth: POST {} model={}", url, self.config.model);
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(url)
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/json")
@@ -505,17 +714,28 @@ impl Brain {
             .await?;
 
         if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
-            warn!("🔑 Codex OAuth: token rejected ({}). Clearing cache — will reload on next tick.", resp.status());
+            warn!(
+                "🔑 Codex OAuth: token rejected ({}). Clearing cache — will reload on next tick.",
+                resp.status()
+            );
             warn!("   If this persists, run `codex login` to re-authenticate.");
             let mut cached = self.codex_token.write().await;
             *cached = None;
-            anyhow::bail!("Codex OAuth: authentication failed ({}). Run `codex login` to refresh.", resp.status());
+            anyhow::bail!(
+                "Codex OAuth: authentication failed ({}). Run `codex login` to refresh.",
+                resp.status()
+            );
         }
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body_text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Codex OAuth API error {} {}: {}", status.as_u16(), status, body_text);
+            anyhow::bail!(
+                "Codex OAuth API error {} {}: {}",
+                status.as_u16(),
+                status,
+                body_text
+            );
         }
 
         // Parse the SSE stream to collect the full response text.
@@ -556,10 +776,12 @@ impl Brain {
                                 collected_text.push_str(delta);
                             }
                         }
-                        // Response completed — try to grab output_text from the full response
+                        // Response completed — grab output_text from the full response
                         "response.completed" => {
                             got_completed = true;
-                            if let Some(output_text) = event["response"]["output_text"].as_str() {
+                            if let Some(output_text) =
+                                event["response"]["output_text"].as_str()
+                            {
                                 if !output_text.is_empty() {
                                     // Use the final complete text instead of deltas
                                     collected_text = output_text.to_string();
@@ -576,8 +798,10 @@ impl Brain {
         }
 
         if collected_text.is_empty() && !got_completed {
-            warn!("Codex OAuth: stream ended but no text collected. Raw body length: {}", full_body.len());
-            // Log first 500 chars for debugging
+            warn!(
+                "Codex OAuth: stream ended but no text collected. Raw body length: {}",
+                full_body.len()
+            );
             let preview: String = full_body.chars().take(500).collect();
             warn!("Codex OAuth: stream preview: {}", preview);
             anyhow::bail!("Codex OAuth: received empty response from stream");
@@ -586,7 +810,9 @@ impl Brain {
         debug!("Codex OAuth: received {} chars", collected_text.len());
         Ok(collected_text)
     }
-}
+} // end impl Brain
+
+// ── Free functions: JSON sanitization & extraction ──────────────────────────
 
 /// Sanitize common LLM JSON issues:
 /// - Curly/smart quotes → straight quotes
@@ -597,24 +823,22 @@ fn sanitize_llm_json(text: &str) -> String {
     let mut s = text.to_string();
 
     // Replace Unicode curly/smart quotes with ASCII equivalents
-    // These are the #1 cause of LLM JSON parse failures
-    s = s.replace('\u{201c}', "\\\"");  // left double curly quote "
-    s = s.replace('\u{201d}', "\\\"");  // right double curly quote "
-    s = s.replace('\u{2018}', "'");     // left single curly quote '
-    s = s.replace('\u{2019}', "'");     // right single curly quote '
-    s = s.replace('\u{00ab}', "\\\"");  // left guillemet «
-    s = s.replace('\u{00bb}', "\\\"");  // right guillemet »
+    s = s.replace('\u{201c}', "\\\""); // left double curly quote "
+    s = s.replace('\u{201d}', "\\\""); // right double curly quote "
+    s = s.replace('\u{2018}', "'"); // left single curly quote '
+    s = s.replace('\u{2019}', "'"); // right single curly quote '
+    s = s.replace('\u{00ab}', "\\\""); // left guillemet «
+    s = s.replace('\u{00bb}', "\\\""); // right guillemet »
 
     // Replace em/en dashes with regular dashes
-    s = s.replace('\u{2014}', "-");     // em dash —
-    s = s.replace('\u{2013}', "-");     // en dash –
+    s = s.replace('\u{2014}', "-"); // em dash —
+    s = s.replace('\u{2013}', "-"); // en dash –
 
     // Replace non-breaking spaces with regular spaces
-    s = s.replace('\u{00a0}', " ");     // NBSP
-    s = s.replace('\u{feff}', "");      // BOM / zero-width no-break space
+    s = s.replace('\u{00a0}', " "); // NBSP
+    s = s.replace('\u{feff}', ""); // BOM / zero-width no-break space
 
     // Remove trailing commas before } or ] (common LLM mistake)
-    // This is a simple regex-free approach
     let bytes = s.as_bytes().to_vec();
     let mut cleaned = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -622,7 +846,12 @@ fn sanitize_llm_json(text: &str) -> String {
         if bytes[i] == b',' {
             // Look ahead past whitespace for } or ]
             let mut j = i + 1;
-            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\n' || bytes[j] == b'\r' || bytes[j] == b'\t') {
+            while j < bytes.len()
+                && (bytes[j] == b' '
+                    || bytes[j] == b'\n'
+                    || bytes[j] == b'\r'
+                    || bytes[j] == b'\t')
+            {
                 j += 1;
             }
             if j < bytes.len() && (bytes[j] == b'}' || bytes[j] == b']') {
@@ -637,6 +866,7 @@ fn sanitize_llm_json(text: &str) -> String {
 
     String::from_utf8(cleaned).unwrap_or(s)
 }
+
 fn repair_truncated_json(s: &str) -> String {
     let start = match s.find('{') {
         Some(i) => i,
@@ -660,7 +890,7 @@ fn repair_truncated_json(s: &str) -> String {
     // Remove trailing comma
     let trimmed = result.trim_end();
     if trimmed.ends_with(',') {
-        result = trimmed[..trimmed.len()-1].to_string();
+        result = trimmed[..trimmed.len() - 1].to_string();
     }
 
     // Count and close open braces/brackets
@@ -669,7 +899,9 @@ fn repair_truncated_json(s: &str) -> String {
     let mut in_string = false;
     let mut prev_char = ' ';
     for c in result.chars() {
-        if c == '"' && prev_char != '\\' { in_string = !in_string; }
+        if c == '"' && prev_char != '\\' {
+            in_string = !in_string;
+        }
         if !in_string {
             match c {
                 '{' => open_braces += 1,
@@ -681,13 +913,18 @@ fn repair_truncated_json(s: &str) -> String {
         }
         prev_char = c;
     }
-    for _ in 0..open_brackets { result.push(']'); }
-    for _ in 0..open_braces { result.push('}'); }
+    for _ in 0..open_brackets {
+        result.push(']');
+    }
+    for _ in 0..open_braces {
+        result.push('}');
+    }
     result
 }
 
 fn extract_partial_actions(s: &str) -> Option<Vec<AgentAction>> {
-    let actions_start = s.find("\"actions\"")
+    let actions_start = s
+        .find("\"actions\"")
         .and_then(|i| s[i..].find('[').map(|j| i + j))?;
     let rest = &s[actions_start..];
     let mut actions: Vec<AgentAction> = Vec::new();
@@ -697,10 +934,14 @@ fn extract_partial_actions(s: &str) -> Option<Vec<AgentAction>> {
     let mut prev = ' ';
 
     for (i, c) in rest.char_indices() {
-        if c == '"' && prev != '\\' { in_string = !in_string; }
+        if c == '"' && prev != '\\' {
+            in_string = !in_string;
+        }
         if !in_string {
             if c == '{' {
-                if depth == 1 { obj_start = Some(i); }
+                if depth == 1 {
+                    obj_start = Some(i);
+                }
                 depth += 1;
             } else if c == '}' {
                 depth -= 1;
@@ -719,10 +960,15 @@ fn extract_partial_actions(s: &str) -> Option<Vec<AgentAction>> {
         }
         prev = c;
     }
-    if actions.is_empty() { None } else { Some(actions) }
+    if actions.is_empty() {
+        None
+    } else {
+        Some(actions)
+    }
 }
 
 fn extract_json(text: &str) -> Option<String> {
+    // Try from the start if it begins with {
     if text.starts_with('{') {
         let mut depth = 0;
         for (i, ch) in text.chars().enumerate() {
@@ -738,12 +984,16 @@ fn extract_json(text: &str) -> Option<String> {
             }
         }
     }
+
+    // Try ```json ... ``` fenced block
     if let Some(start) = text.find("```json") {
         let after = &text[start + 7..];
         if let Some(end) = after.find("```") {
             return Some(after[..end].trim().to_string());
         }
     }
+
+    // Try ``` ... ``` fenced block
     if let Some(start) = text.find("```") {
         let after = &text[start + 3..];
         if let Some(end) = after.find("```") {
@@ -753,6 +1003,8 @@ fn extract_json(text: &str) -> Option<String> {
             }
         }
     }
+
+    // Try finding first { anywhere in the text
     if let Some(start) = text.find('{') {
         let mut depth = 0;
         for (i, ch) in text[start..].chars().enumerate() {
@@ -768,5 +1020,6 @@ fn extract_json(text: &str) -> Option<String> {
             }
         }
     }
+
     None
 }

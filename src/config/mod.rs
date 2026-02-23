@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use std::path::Path;
 use crate::tailscale::TailscaleConfig;
+use crate::stuck::StuckConfig;
+use crate::fallback::ModelConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -15,6 +17,8 @@ pub struct Config {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub tailscale: TailscaleConfig,
+    #[serde(default)]
+    pub stuck: StuckConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,11 +56,22 @@ pub struct BrainConfig {
     /// Path to Codex OAuth auth.json (defaults to ~/.codex/auth.json)
     #[serde(default)]
     pub codex_auth_path: Option<String>,
+    #[serde(default)]
+    pub fallback_on_rate_limit: bool,
+    #[serde(default)]
+    pub fallback_on_auth_error: bool,
+    #[serde(default)]
+    pub fallback_on_timeout: bool,
+    #[serde(default = "default_cooldown")]
+    pub fallback_cooldown_secs: u64,
+    #[serde(default)]
+    pub fallbacks: Vec<ModelConfig>,
 }
 
 fn default_max_tokens() -> u32 { 2048 }
 fn default_temperature() -> f32 { 0.7 }
 fn default_thinking() -> String { "medium".into() }
+fn default_cooldown() -> u64 { 60 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PerceptionConfig {
@@ -75,8 +90,16 @@ pub struct PerceptionConfig {
     /// Priority apps (notifications from these trigger immediate ticks)
     #[serde(default)]
     pub priority_apps: Vec<String>,
+    /// Vision mode: "off" | "fallback" | "always" (default: "fallback")
+    #[serde(default = "default_vision_mode")]
+    pub vision_mode: String,
+    /// Max UI elements to send to LLM from accessibility tree (default: 50)
+    #[serde(default = "default_max_elements")]
+    pub max_elements: usize,
 }
 
+fn default_vision_mode() -> String { "fallback".to_string() }
+fn default_max_elements() -> usize { 50 }
 fn default_ws_addr() -> String { "ws://192.168.1.100:9090".into() }
 fn default_true() -> bool { true }
 

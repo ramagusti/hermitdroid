@@ -1,0 +1,13 @@
+{
+  "name": "Food Order",
+  "description": "Browse food delivery options",
+  "steps": [
+    {
+      "app": "com.gojek.app",
+      "goal": "Open GoFood, search for the restaurant, and browse the menu",
+      "form_data": {
+        "restaurant": "McDonalds"
+      }
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "Slack Standup",
+  "description": "Post daily standup update to a Slack channel",
+  "steps": [
+    {
+      "app": "com.Slack",
+      "goal": "Open the #standup channel, type the standup message and send it",
+      "form_data": {
+        "message": "yesterday: api integration\ntoday: writing tests\nblockers: none"
+      }
+    }
+  ]
+}

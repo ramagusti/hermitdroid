@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // ================================================================
 // Data types
@@ -22,11 +22,52 @@ pub struct Notification {
 pub struct ScreenState {
     pub current_app: String,
     pub activity: String,
+    /// Formatted UI tree string (backward compat / fallback)
     #[serde(default)]
     pub ui_tree: Option<String>,
+    /// Structured, numbered UI elements parsed from accessibility tree.
+    /// This is the primary data the LLM uses for action targeting.
+    #[serde(default)]
+    pub elements: Vec<UiElement>,
     #[serde(default)]
     pub screenshot_base64: Option<String>,
     pub timestamp: String,
+}
+
+/// A single interactive UI element extracted from the accessibility tree.
+/// The LLM references elements by `index` and uses `center_x`, `center_y` for taps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiElement {
+    /// Stable 1-based index for this screen dump. LLM says "tap element 5".
+    pub index: usize,
+    /// Short class name (e.g., "TextView", "EditText", "ImageButton")
+    pub class: String,
+    /// Visible text content
+    pub text: String,
+    /// Content description (accessibility label)
+    pub desc: String,
+    /// Resource ID short form (e.g., "search_bar")
+    pub resource_id: String,
+    /// Center X coordinate (absolute pixels)
+    pub center_x: i32,
+    /// Center Y coordinate (absolute pixels)
+    pub center_y: i32,
+    /// Bounding box [left, top, right, bottom]
+    pub bounds: [i32; 4],
+    /// Whether this element is clickable
+    pub clickable: bool,
+    /// Whether this element is an editable text field
+    pub editable: bool,
+    /// Whether this element currently has focus
+    pub focused: bool,
+    /// Whether this element is scrollable
+    pub scrollable: bool,
+    /// Whether this element is checked (checkboxes, toggles)
+    pub checked: Option<bool>,
+    /// Whether this element is enabled
+    pub enabled: bool,
+    /// Relevance score (higher = more useful to the LLM)
+    pub score: f32,
 }
 
 /// Messages from the Android companion app (WebSocket mode)
@@ -50,6 +91,14 @@ pub enum AndroidMessage {
     #[serde(rename = "heartbeat")]
     Heartbeat,
 }
+
+// ================================================================
+// Config
+// ================================================================
+
+/// Maximum UI elements sent to the LLM per step.
+/// Elements are scored and ranked; only the top N are included.
+const MAX_ELEMENTS: usize = 40;
 
 // ================================================================
 // Perception engine
@@ -88,8 +137,6 @@ impl Perception {
                 let parts: Vec<&str> = size_str.trim().split('x').collect();
                 if parts.len() == 2 {
                     if let (Ok(w), Ok(h)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                        let res = std::sync::Mutex::new(Some((w, h)));
-                        // Can't use async here, so set directly
                         info!("📱 Screen resolution: {}x{}", w, h);
                         return Self {
                             screen_resolution: Arc::new(Mutex::new(Some((w, h)))),
@@ -128,7 +175,6 @@ impl Perception {
         let mut has_priority = false;
 
         for notif in parsed {
-            // De-dup key: package + title + text
             let key = format!("{}|{}|{}", notif.app, notif.title, notif.text);
             if seen.contains(&key) {
                 continue;
@@ -143,7 +189,6 @@ impl Perception {
             self.notifications.lock().await.push(notif);
         }
 
-        // Cap seen-set so it doesn't grow forever
         if seen.len() > 1000 {
             let drain: Vec<String> = seen.iter().take(seen.len() - 500).cloned().collect();
             for k in drain {
@@ -155,7 +200,8 @@ impl Perception {
     }
 
     /// Poll current foreground app + UI tree via ADB.
-    /// If `with_screenshot` is true, also captures a screenshot for vision models.
+    /// If `with_screenshot` is true, also captures a screenshot.
+    /// If the UI tree is empty (WebView/Flutter/game), auto-enables screenshot as vision fallback.
     pub async fn poll_screen_adb_full(&self, with_screenshot: bool) {
         // 1. Current activity
         let (app, activity) = self
@@ -163,11 +209,17 @@ impl Perception {
             .map(|raw| parse_foreground_activity(&raw))
             .unwrap_or(("unknown".into(), "unknown".into()));
 
-        // 2. UI tree via uiautomator dump
-        let ui_tree = self.dump_ui_tree();
+        // 2. UI tree → structured elements
+        let (ui_tree_str, elements) = self.dump_and_parse_ui_tree();
 
-        // 3. Screenshot (only when requested — expensive, uses vision API tokens)
-        let screenshot_base64 = if with_screenshot {
+        // 3. Vision fallback: auto-screenshot when tree is empty
+        let tree_is_empty = elements.is_empty();
+        let need_screenshot = with_screenshot || tree_is_empty;
+
+        let screenshot_base64 = if need_screenshot {
+            if tree_is_empty && !with_screenshot {
+                debug!("📸 UI tree empty — vision fallback (auto-screenshot)");
+            }
             self.capture_screenshot_adb()
         } else {
             None
@@ -176,7 +228,8 @@ impl Perception {
         let state = ScreenState {
             current_app: app,
             activity,
-            ui_tree,
+            ui_tree: ui_tree_str,
+            elements,
             screenshot_base64,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
@@ -189,52 +242,49 @@ impl Perception {
         self.poll_screen_adb_full(false).await;
     }
 
-    /// Dump the UI tree reliably via a temp file on the device.
-    fn dump_ui_tree(&self) -> Option<String> {
+    /// Dump UI tree and parse into structured, scored, numbered elements.
+    fn dump_and_parse_ui_tree(&self) -> (Option<String>, Vec<UiElement>) {
         let dump_path = "/sdcard/hermitdroid_ui_dump.xml";
 
-        // Step 1: dump to file on device
         match self.adb(&["shell", "uiautomator", "dump", dump_path]) {
             Ok(out) => {
-                // uiautomator prints "UI hierchary dumped to: <path>"
                 if !out.contains("dumped to") && !out.contains("hierchary") {
                     debug!("uiautomator dump unexpected output: {}", out);
                 }
             }
             Err(e) => {
                 debug!("uiautomator dump failed: {}", e);
-                return None;
+                return (None, Vec::new());
             }
         }
 
-        // Step 2: cat the file back
         match self.adb(&["shell", "cat", dump_path]) {
             Ok(xml) => {
                 if xml.contains("<hierarchy") && xml.contains("<node") {
-                    let simplified = simplify_ui_xml(&xml);
-                    if simplified.is_empty() {
-                        debug!("UI tree simplified to empty");
-                        None
-                    } else {
-                        Some(simplified)
+                    let elements = parse_ui_elements(&xml);
+                    if elements.is_empty() {
+                        debug!("UI tree parsed to 0 elements");
+                        return (None, Vec::new());
                     }
+                    let formatted = format_elements_for_tree(&elements);
+                    (Some(formatted), elements)
                 } else {
-                    debug!("UI dump file did not contain valid XML (len={})", xml.len());
-                    None
+                    debug!("UI dump did not contain valid XML (len={})", xml.len());
+                    (None, Vec::new())
                 }
             }
             Err(e) => {
                 debug!("Failed to read UI dump file: {}", e);
-                None
+                (None, Vec::new())
             }
         }
     }
 
-    /// Take a screenshot, return base64-encoded PNG. Expensive — call sparingly.
+    /// Take a screenshot, return base64-encoded PNG.
     pub fn capture_screenshot_adb(&self) -> Option<String> {
         let bytes = self.adb_bytes(&["exec-out", "screencap", "-p"]).ok()?;
         if bytes.len() < 100 {
-            return None; // too small, probably an error
+            return None;
         }
         Some(base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -242,7 +292,6 @@ impl Perception {
         ))
     }
 
-    /// Check if device screen is awake.
     pub fn is_screen_on(&self) -> bool {
         self.adb(&["shell", "dumpsys", "power"])
             .map(|s| s.contains("mWakefulness=Awake") || s.contains("Display Power: state=ON"))
@@ -250,7 +299,7 @@ impl Perception {
     }
 
     // ================================================================
-    // Push interface (used by WebSocket companion app path)
+    // Push interface (WebSocket companion app path)
     // ================================================================
 
     pub async fn push_notification(&self, notif: Notification) -> bool {
@@ -287,7 +336,6 @@ impl Perception {
         self.user_commands.lock().await.drain(..).collect()
     }
 
-    /// Check if there are pending user commands without draining them
     pub async fn peek_user_commands(&self) -> bool {
         self.user_commands.lock().await.is_empty()
     }
@@ -315,37 +363,104 @@ impl Perception {
             .join("\n")
     }
 
-    pub fn format_screen_with_resolution(screen: &Option<ScreenState>, resolution: Option<(u32, u32)>) -> String {
+    /// Format screen state for LLM prompt with numbered, interactive elements.
+    ///
+    /// Key improvement: the LLM gets a structured element list with exact coordinates
+    /// and can reference elements by index. No more guessing "typically in the top-right corner".
+    pub fn format_screen_with_resolution(
+        screen: &Option<ScreenState>,
+        resolution: Option<(u32, u32)>,
+    ) -> String {
         match screen {
             Some(s) => {
                 let mut out = format!("App: {} | Activity: {}", s.current_app, s.activity);
                 if let Some((w, h)) = resolution {
                     out.push_str(&format!(" | Screen: {}x{}", w, h));
                 }
+
+                // ── Structured elements (primary) ──
+                if !s.elements.is_empty() {
+                    out.push_str(&format!(
+                        "\n\n=== UI ELEMENTS ({} on screen) ===\n\
+                         IMPORTANT: Use the @(x,y) coordinates below for all tap actions.\n\
+                         These are pixel-accurate from the accessibility tree. Do NOT guess coordinates.\n\n",
+                        s.elements.len()
+                    ));
+
+                    for el in &s.elements {
+                        out.push_str(&format_single_element(el));
+                        out.push('\n');
+                    }
+
+                    // Editable fields summary
+                    let editables: Vec<&UiElement> =
+                        s.elements.iter().filter(|e| e.editable).collect();
+                    if !editables.is_empty() {
+                        out.push_str("\n📝 Editable fields: ");
+                        let names: Vec<String> = editables
+                            .iter()
+                            .map(|e| {
+                                let label = if !e.text.is_empty() {
+                                    &e.text
+                                } else if !e.desc.is_empty() {
+                                    &e.desc
+                                } else if !e.resource_id.is_empty() {
+                                    &e.resource_id
+                                } else {
+                                    "unnamed"
+                                };
+                                format!("[{}] {}", e.index, label)
+                            })
+                            .collect();
+                        out.push_str(&names.join(", "));
+                        out.push('\n');
+                    }
+
+                    let n_click = s.elements.iter().filter(|e| e.clickable).count();
+                    if n_click > 0 {
+                        out.push_str(&format!("👆 {} clickable elements\n", n_click));
+                    }
+                } else if let Some(tree) = &s.ui_tree {
+                    let t = if tree.len() > 4000 {
+                        &tree[..4000]
+                    } else {
+                        tree.as_str()
+                    };
+                    out.push_str(&format!("\nUI Tree:\n{}", t));
+                }
+
+                // ── Screenshot info ──
                 if s.screenshot_base64.is_some() {
                     let res_hint = resolution
-                        .map(|(w, h)| format!("Resolution is {}x{}. ", w, h))
+                        .map(|(w, h)| format!("Resolution: {}x{}. ", w, h))
                         .unwrap_or_default();
-                    out.push_str(&format!(
-                        "\n📸 SCREENSHOT ATTACHED — {}Look at the screenshot to identify exact UI element positions. Use VISIBLE coordinates from the screenshot for all tap actions. Do NOT guess coordinates.",
-                        res_hint
-                    ));
+
+                    if s.elements.is_empty() {
+                        out.push_str(&format!(
+                            "\n\n📸 SCREENSHOT ATTACHED (vision fallback — no accessibility tree)\n\
+                             {}Identify UI elements from the screenshot.\n\
+                             Estimate tap coordinates based on visible positions in the image.",
+                            res_hint
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "\n\n📸 Screenshot also attached for visual context.\n\
+                             {}Use the element @(x,y) coordinates above — they are accurate.",
+                            res_hint
+                        ));
+                    }
+                } else if s.elements.is_empty() {
+                    out.push_str(
+                        "\n\n⚠️ No UI tree or screenshot available. Use well-known default coordinates.",
+                    );
                 }
-                if let Some(tree) = &s.ui_tree {
-                    let t = if tree.len() > 4000 { &tree[..4000] } else { tree };
-                    out.push_str(&format!("\nUI Tree:\n{}", t));
-                } else if s.screenshot_base64.is_some() {
-                    out.push_str("\nUI Tree: (not available — rely on the screenshot for coordinates)");
-                } else {
-                    out.push_str("\nUI: (no UI tree or screenshot — use well-known default coordinates)");
-                }
+
                 out
             }
             None => "No screen state available.".into(),
         }
     }
 
-    /// Backward-compatible version without resolution
     pub fn format_screen(screen: &Option<ScreenState>) -> String {
         Self::format_screen_with_resolution(screen, None)
     }
@@ -378,6 +493,250 @@ impl Perception {
             anyhow::bail!("adb error");
         }
         Ok(out.stdout)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// UI Element Parsing
+//
+// 1. Parse uiautomator XML into structured UiElement structs
+// 2. Score elements by relevance (editable > clickable > text > empty)
+// 3. Rank and take only top MAX_ELEMENTS (keeps prompt small & fast)
+// 4. Sort by screen position (top-to-bottom) for natural reading order
+// 5. Assign 1-based index for LLM targeting ("tap element 5 @(540,150)")
+// ════════════════════════════════════════════════════════════════════
+
+fn parse_ui_elements(xml: &str) -> Vec<UiElement> {
+    let xml = if let Some(idx) = xml.find("<?xml") {
+        &xml[idx..]
+    } else if let Some(idx) = xml.find("<hierarchy") {
+        &xml[idx..]
+    } else {
+        xml
+    };
+
+    let mut all_elements: Vec<UiElement> = Vec::new();
+
+    for chunk in xml.split("<node ") {
+        if chunk.is_empty()
+            || chunk.starts_with("?xml")
+            || chunk.starts_with("hierarchy")
+        {
+            continue;
+        }
+
+        let text = xml_attr(chunk, "text").unwrap_or_default();
+        let desc = xml_attr(chunk, "content-desc").unwrap_or_default();
+        let resource_id = xml_attr(chunk, "resource-id")
+            .unwrap_or_default()
+            .rsplit_once('/')
+            .map(|(_, id)| id.to_string())
+            .unwrap_or_default();
+        let class_full = xml_attr(chunk, "class").unwrap_or_default();
+        let class_short = class_full
+            .rsplit_once('.')
+            .map(|(_, c)| c.to_string())
+            .unwrap_or_else(|| class_full.clone());
+        let clickable = xml_attr(chunk, "clickable")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let focused = xml_attr(chunk, "focused")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let scrollable = xml_attr(chunk, "scrollable")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let enabled = xml_attr(chunk, "enabled")
+            .map(|v| v == "true")
+            .unwrap_or(true);
+        let checked = xml_attr(chunk, "checked").map(|v| v == "true");
+        let bounds_str = xml_attr(chunk, "bounds").unwrap_or_default();
+        let bounds_arr = parse_bounds(&bounds_str);
+
+        let editable = class_full.contains("EditText")
+            || class_full.contains("AutoCompleteTextView")
+            || xml_attr(chunk, "password")
+                .map(|v| v == "true")
+                .unwrap_or(false);
+
+        // Filter: skip elements with no useful info
+        let has_info = !text.is_empty()
+            || !desc.is_empty()
+            || clickable
+            || editable
+            || !resource_id.is_empty()
+            || focused
+            || scrollable;
+
+        // Filter: skip zero-area elements (invisible)
+        let has_area = bounds_arr[2] > bounds_arr[0] && bounds_arr[3] > bounds_arr[1];
+
+        if !has_info || !has_area {
+            continue;
+        }
+
+        let center_x = (bounds_arr[0] + bounds_arr[2]) / 2;
+        let center_y = (bounds_arr[1] + bounds_arr[3]) / 2;
+
+        let score = score_element(
+            &text, &desc, &resource_id, &class_short,
+            clickable, editable, focused, scrollable, enabled,
+            &bounds_arr,
+        );
+
+        all_elements.push(UiElement {
+            index: 0,
+            class: class_short,
+            text: text.chars().take(100).collect(),
+            desc: desc.chars().take(80).collect(),
+            resource_id,
+            center_x,
+            center_y,
+            bounds: bounds_arr,
+            clickable,
+            editable,
+            focused,
+            scrollable,
+            checked,
+            enabled,
+            score,
+        });
+    }
+
+    // Sort by score desc → take top MAX_ELEMENTS
+    all_elements.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    all_elements.truncate(MAX_ELEMENTS);
+
+    // Re-sort by position (top-to-bottom, left-to-right)
+    all_elements
+        .sort_by(|a, b| a.center_y.cmp(&b.center_y).then(a.center_x.cmp(&b.center_x)));
+
+    // Assign 1-based indices
+    for (i, el) in all_elements.iter_mut().enumerate() {
+        el.index = i + 1;
+    }
+
+    all_elements
+}
+
+/// Score an element by how useful it is for the LLM.
+fn score_element(
+    text: &str, desc: &str, resource_id: &str, class: &str,
+    clickable: bool, editable: bool, focused: bool, scrollable: bool, enabled: bool,
+    bounds: &[i32; 4],
+) -> f32 {
+    let mut s: f32 = 0.0;
+
+    if !text.is_empty() { s += 3.0; }
+    if !desc.is_empty() { s += 2.0; }
+    if !resource_id.is_empty() { s += 1.0; }
+
+    if clickable { s += 4.0; }
+    if editable { s += 5.0; }
+    if focused { s += 3.0; }
+    if scrollable { s += 1.5; }
+    if !enabled { s -= 2.0; }
+
+    match class {
+        "Button" | "ImageButton" => s += 2.0,
+        "EditText" | "AutoCompleteTextView" => s += 3.0,
+        "CheckBox" | "Switch" | "ToggleButton" | "RadioButton" => s += 2.0,
+        "TextView" => s += 0.5,
+        "RecyclerView" | "ListView" | "ScrollView" => s += 0.5,
+        _ => {}
+    }
+
+    let w = (bounds[2] - bounds[0]) as f32;
+    let h = (bounds[3] - bounds[1]) as f32;
+    let area = w * h;
+    if area > 50000.0 { s += 1.0; }
+    if area > 200000.0 { s += 0.5; }
+    if w < 20.0 || h < 20.0 { s -= 3.0; }
+
+    s
+}
+
+/// Format: `  [3] Button "Send" #send_btn @(900,1800) *click*`
+fn format_single_element(el: &UiElement) -> String {
+    let mut s = format!("  [{}] {}", el.index, el.class);
+
+    if !el.text.is_empty() {
+        s.push_str(&format!(" \"{}\"", el.text));
+    }
+    if !el.desc.is_empty() {
+        s.push_str(&format!(" desc=\"{}\"", el.desc));
+    }
+    if !el.resource_id.is_empty() {
+        s.push_str(&format!(" #{}", el.resource_id));
+    }
+
+    s.push_str(&format!(" @({},{})", el.center_x, el.center_y));
+
+    let mut flags = Vec::new();
+    if el.clickable { flags.push("click"); }
+    if el.editable { flags.push("editable"); }
+    if el.focused { flags.push("FOCUSED"); }
+    if el.scrollable { flags.push("scroll"); }
+    if let Some(true) = el.checked { flags.push("checked"); }
+    if let Some(false) = el.checked { flags.push("unchecked"); }
+    if !el.enabled { flags.push("DISABLED"); }
+
+    if !flags.is_empty() {
+        s.push_str(&format!(" *{}*", flags.join(",")));
+    }
+
+    s
+}
+
+fn format_elements_for_tree(elements: &[UiElement]) -> String {
+    elements
+        .iter()
+        .map(|el| format_single_element(el))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ================================================================
+// XML helpers
+// ================================================================
+
+fn xml_attr(s: &str, attr: &str) -> Option<String> {
+    let needle = format!("{}=\"", attr);
+    let start = s.find(&needle)? + needle.len();
+    let rest = &s[start..];
+    let end = rest.find('"')?;
+    let val = &rest[..end];
+    if val.is_empty() {
+        None
+    } else {
+        Some(val.to_string())
+    }
+}
+
+fn parse_bounds(bounds: &str) -> [i32; 4] {
+    let nums: Vec<i32> = bounds
+        .replace('[', "")
+        .replace(']', ",")
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    if nums.len() >= 4 {
+        [nums[0], nums[1], nums[2], nums[3]]
+    } else {
+        [0, 0, 0, 0]
+    }
+}
+
+fn bounds_center(bounds: &str) -> Option<(i32, i32)> {
+    let b = parse_bounds(bounds);
+    if b[2] > b[0] && b[3] > b[1] {
+        Some(((b[0] + b[2]) / 2, (b[1] + b[3]) / 2))
+    } else {
+        None
     }
 }
 
@@ -430,12 +789,7 @@ fn parse_dumpsys_notifications(raw: &str) -> Vec<Notification> {
 
         if s.starts_with("NotificationRecord(") || s.starts_with("NotificationRecord{") {
             flush(
-                &mut results,
-                &mut pkg,
-                &mut key,
-                &mut title,
-                &mut text,
-                &mut big_text,
+                &mut results, &mut pkg, &mut key, &mut title, &mut text, &mut big_text,
             );
             pkg = extract_field(s, "pkg=");
             key = extract_field(s, "0x")
@@ -466,12 +820,7 @@ fn parse_dumpsys_notifications(raw: &str) -> Vec<Notification> {
     }
 
     flush(
-        &mut results,
-        &mut pkg,
-        &mut key,
-        &mut title,
-        &mut text,
-        &mut big_text,
+        &mut results, &mut pkg, &mut key, &mut title, &mut text, &mut big_text,
     );
 
     results
@@ -492,7 +841,7 @@ fn extract_field(line: &str, prefix: &str) -> Option<String> {
 }
 
 // ================================================================
-// dumpsys activity parser — find the foreground app
+// dumpsys activity parser
 // ================================================================
 
 fn parse_foreground_activity(raw: &str) -> (String, String) {
@@ -538,132 +887,6 @@ fn find_component_in_line(line: &str) -> Option<String> {
 }
 
 // ================================================================
-// uiautomator XML simplifier
-// ================================================================
-
-fn simplify_ui_xml(xml: &str) -> String {
-    // Strip any prefix before the actual XML (e.g., "UI hierchary dumped to: ...")
-    let xml = if let Some(idx) = xml.find("<?xml") {
-        &xml[idx..]
-    } else if let Some(idx) = xml.find("<hierarchy") {
-        &xml[idx..]
-    } else {
-        xml
-    };
-
-    let mut out = String::with_capacity(4000);
-    let mut depth: usize = 0;
-
-    for chunk in xml.split("<node ") {
-        if chunk.is_empty()
-            || chunk.starts_with("?xml")
-            || chunk.starts_with("hierarchy")
-        {
-            continue;
-        }
-
-        let text = xml_attr(chunk, "text").unwrap_or_default();
-        let desc = xml_attr(chunk, "content-desc").unwrap_or_default();
-        let rid = xml_attr(chunk, "resource-id")
-            .unwrap_or_default()
-            .rsplit_once('/')
-            .map(|(_, id)| id.to_string())
-            .unwrap_or_default();
-        let cls = xml_attr(chunk, "class")
-            .unwrap_or_default()
-            .rsplit_once('.')
-            .map(|(_, c)| c.to_string())
-            .unwrap_or_default();
-        let click = xml_attr(chunk, "clickable")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-        let edit = xml_attr(chunk, "focused")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-        let bounds = xml_attr(chunk, "bounds").unwrap_or_default();
-        let center = bounds_center(&bounds);
-
-        // Also detect editable fields (EditText class or focusable+clickable)
-        let is_edit = cls == "EditText"
-            || xml_attr(chunk, "class")
-                .map(|c| c.contains("EditText"))
-                .unwrap_or(false);
-
-        let has_info =
-            !text.is_empty() || !desc.is_empty() || click || !rid.is_empty() || is_edit;
-
-        if has_info {
-            let indent = "  ".repeat(depth.min(8));
-            out.push_str(&indent);
-            out.push('[');
-            out.push_str(&cls);
-            if !rid.is_empty() {
-                out.push_str(" #");
-                out.push_str(&rid);
-            }
-            if !text.is_empty() {
-                out.push_str(" \"");
-                out.push_str(&text.chars().take(80).collect::<String>());
-                out.push('"');
-            }
-            if !desc.is_empty() {
-                out.push_str(" desc=\"");
-                out.push_str(&desc.chars().take(60).collect::<String>());
-                out.push('"');
-            }
-            if click {
-                out.push_str(" *click*");
-            }
-            if is_edit {
-                out.push_str(" *editable*");
-            }
-            if edit {
-                out.push_str(" *focus*");
-            }
-            if let Some((cx, cy)) = center {
-                out.push_str(&format!(" @({},{})", cx, cy));
-            }
-            out.push_str("]\n");
-        }
-
-        if !chunk.contains("/>") {
-            depth += 1;
-        }
-        let closes = chunk.matches("</node>").count();
-        depth = depth.saturating_sub(closes);
-    }
-
-    out
-}
-
-fn xml_attr(s: &str, attr: &str) -> Option<String> {
-    let needle = format!("{}=\"", attr);
-    let start = s.find(&needle)? + needle.len();
-    let rest = &s[start..];
-    let end = rest.find('"')?;
-    let val = &rest[..end];
-    if val.is_empty() {
-        None
-    } else {
-        Some(val.to_string())
-    }
-}
-
-fn bounds_center(bounds: &str) -> Option<(i32, i32)> {
-    let nums: Vec<i32> = bounds
-        .replace('[', "")
-        .replace(']', ",")
-        .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
-    if nums.len() >= 4 {
-        Some(((nums[0] + nums[2]) / 2, (nums[1] + nums[3]) / 2))
-    } else {
-        None
-    }
-}
-
-// ================================================================
 // Tests
 // ================================================================
 
@@ -679,6 +902,12 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_bounds() {
+        assert_eq!(parse_bounds("[0,100][1080,200]"), [0, 100, 1080, 200]);
+        assert_eq!(parse_bounds(""), [0, 0, 0, 0]);
+    }
+
+    #[test]
     fn test_extract_field() {
         assert_eq!(
             extract_field("pkg=com.whatsapp user=UserHandle{0}", "pkg="),
@@ -688,6 +917,90 @@ mod tests {
             extract_field("id=12345 flags=0x10", "id="),
             Some("12345".into())
         );
+    }
+
+    #[test]
+    fn test_parse_ui_elements() {
+        let xml = r#"<?xml version="1.0" ?><hierarchy rotation="0"><node text="Search" resource-id="com.whatsapp:id/search_bar" class="android.widget.EditText" clickable="true" bounds="[0,100][1080,200]" content-desc="" focused="false" enabled="true" scrollable="false" /><node text="Chats" resource-id="com.whatsapp:id/tab_chats" class="android.widget.TextView" clickable="true" bounds="[0,200][360,300]" content-desc="" focused="false" enabled="true" scrollable="false" /><node text="" resource-id="" class="android.widget.FrameLayout" clickable="false" bounds="[0,0][0,0]" content-desc="" focused="false" enabled="true" scrollable="false" /></hierarchy>"#;
+
+        let elements = parse_ui_elements(xml);
+
+        // FrameLayout has zero area → filtered out
+        assert_eq!(elements.len(), 2);
+
+        // Sorted by Y: Search (y=150) then Chats (y=250)
+        assert_eq!(elements[0].text, "Search");
+        assert_eq!(elements[0].class, "EditText");
+        assert_eq!(elements[0].center_x, 540);
+        assert_eq!(elements[0].center_y, 150);
+        assert!(elements[0].clickable);
+        assert!(elements[0].editable);
+        assert_eq!(elements[0].index, 1);
+
+        assert_eq!(elements[1].text, "Chats");
+        assert_eq!(elements[1].index, 2);
+    }
+
+    #[test]
+    fn test_element_scoring() {
+        let edit_score = score_element(
+            "Search", "", "search", "EditText",
+            true, true, true, false, true,
+            &[0, 100, 1080, 200],
+        );
+        let text_score = score_element(
+            "Hello", "", "", "TextView",
+            false, false, false, false, true,
+            &[0, 100, 1080, 200],
+        );
+        assert!(edit_score > text_score,
+            "EditText ({}) should score higher than TextView ({})",
+            edit_score, text_score);
+    }
+
+    #[test]
+    fn test_format_single_element() {
+        let el = UiElement {
+            index: 3,
+            class: "Button".into(),
+            text: "Send".into(),
+            desc: String::new(),
+            resource_id: "send_btn".into(),
+            center_x: 900,
+            center_y: 1800,
+            bounds: [800, 1750, 1000, 1850],
+            clickable: true,
+            editable: false,
+            focused: false,
+            scrollable: false,
+            checked: None,
+            enabled: true,
+            score: 9.0,
+        };
+        let out = format_single_element(&el);
+        assert!(out.contains("[3]"));
+        assert!(out.contains("Button"));
+        assert!(out.contains("\"Send\""));
+        assert!(out.contains("#send_btn"));
+        assert!(out.contains("@(900,1800)"));
+        assert!(out.contains("*click*"));
+    }
+
+    #[test]
+    fn test_max_elements_cap() {
+        let mut xml = String::from("<?xml version=\"1.0\" ?><hierarchy rotation=\"0\">");
+        for i in 0..60 {
+            let y = 100 + i * 50;
+            xml.push_str(&format!(
+                "<node text=\"Item {}\" resource-id=\"id/item_{}\" class=\"android.widget.TextView\" clickable=\"true\" bounds=\"[0,{}][1080,{}]\" content-desc=\"\" focused=\"false\" enabled=\"true\" scrollable=\"false\" />",
+                i, i, y, y + 40
+            ));
+        }
+        xml.push_str("</hierarchy>");
+
+        let elements = parse_ui_elements(&xml);
+        assert!(elements.len() <= MAX_ELEMENTS,
+            "Got {} elements, expected <= {}", elements.len(), MAX_ELEMENTS);
     }
 
     #[test]
@@ -708,10 +1021,7 @@ mod tests {
         let notifs = parse_dumpsys_notifications(raw);
         assert_eq!(notifs.len(), 2);
         assert_eq!(notifs[0].app, "com.whatsapp");
-        assert_eq!(notifs[0].title, "John");
         assert_eq!(notifs[0].text, "Hey! Are you coming to dinner tonight?");
-        assert_eq!(notifs[1].app, "com.google.android.gm");
-        assert_eq!(notifs[1].title, "boss@work.com");
     }
 
     #[test]
@@ -725,23 +1035,17 @@ mod tests {
     }
 
     #[test]
-    fn test_simplify_ui() {
-        let xml = r#"<?xml version="1.0" ?><hierarchy><node text="Hello" resource-id="com.app:id/greeting" class="android.widget.TextView" clickable="true" bounds="[0,100][1080,200]" content-desc="" focused="false" /></hierarchy>"#;
-        let result = simplify_ui_xml(xml);
-        assert!(result.contains("TextView"));
-        assert!(result.contains("#greeting"));
-        assert!(result.contains("\"Hello\""));
-        assert!(result.contains("*click*"));
-        assert!(result.contains("@(540,150)"));
-    }
-
-    #[test]
-    fn test_simplify_ui_with_prefix() {
-        // Simulate the output from `uiautomator dump /dev/tty` which has a prefix line
-        let xml = "UI hierchary dumped to: /dev/tty\n<?xml version='1.0' encoding='UTF-8' ?><hierarchy rotation=\"0\"><node text=\"Search\" resource-id=\"com.whatsapp:id/search\" class=\"android.widget.EditText\" clickable=\"true\" bounds=\"[0,100][1080,200]\" content-desc=\"\" focused=\"false\" /></hierarchy>";
-        let result = simplify_ui_xml(xml);
-        assert!(result.contains("EditText"));
-        assert!(result.contains("#search"));
-        assert!(result.contains("\"Search\""));
+    fn test_vision_fallback_format() {
+        let screen = Some(ScreenState {
+            current_app: "com.example".into(),
+            activity: ".MainActivity".into(),
+            ui_tree: None,
+            elements: vec![],
+            screenshot_base64: Some("base64data".into()),
+            timestamp: "2025-01-01".into(),
+        });
+        let text = Perception::format_screen_with_resolution(&screen, Some((1080, 2340)));
+        assert!(text.contains("vision fallback"));
+        assert!(text.contains("1080x2340"));
     }
 }

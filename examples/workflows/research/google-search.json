@@ -1,0 +1,13 @@
+{
+  "name": "Google Search",
+  "description": "Search Google and read top results",
+  "steps": [
+    {
+      "app": "com.android.chrome",
+      "goal": "Open Chrome, search Google for the query, and read the top 3 results",
+      "form_data": {
+        "query": "best restaurants near me"
+      }
+    }
+  ]
+}

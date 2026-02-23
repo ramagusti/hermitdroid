@@ -1,0 +1,13 @@
+{
+  "name": "YouTube Search",
+  "description": "Search YouTube for a topic",
+  "steps": [
+    {
+      "app": "com.google.android.youtube",
+      "goal": "Search for the specified query on YouTube",
+      "form_data": {
+        "query": "lofi hip hop"
+      }
+    }
+  ]
+}

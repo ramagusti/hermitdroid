@@ -1,0 +1,13 @@
+{
+  "name": "Maps Commute",
+  "description": "Check commute time to a destination",
+  "steps": [
+    {
+      "app": "com.google.android.apps.maps",
+      "goal": "Get directions to the destination and check the current travel time",
+      "form_data": {
+        "destination": "Office"
+      }
+    }
+  ]
+}

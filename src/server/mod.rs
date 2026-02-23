@@ -541,7 +541,7 @@ async fn tailscale_disconnect(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"ok": true}))
 }
 
-async fn tailscale_peers(State(state): State<AppState>) -> Json<Value> {
+async fn tailscale_peers(State(_state): State<AppState>) -> Json<Value> {
     let peers = TailscaleManager::list_peers(true);
     Json(json!({"ok": true, "data": peers}))
 }

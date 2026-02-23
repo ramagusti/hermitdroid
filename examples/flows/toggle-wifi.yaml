@@ -1,0 +1,11 @@
+name: Toggle WiFi
+description: Open Settings and toggle WiFi on/off
+app_id: com.android.settings
+---
+- tap_text: "Network & internet"
+- wait: 1
+- tap_text: "Internet"
+- wait: 1
+- tap_text: "Wi-Fi"
+- wait: 0.5
+- done: "WiFi toggled"

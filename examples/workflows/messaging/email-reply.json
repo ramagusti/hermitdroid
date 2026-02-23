@@ -1,0 +1,14 @@
+{
+  "name": "Email Reply",
+  "description": "Open Gmail and reply to the most recent email from a sender",
+  "steps": [
+    {
+      "app": "com.google.android.gm",
+      "goal": "Find the most recent email from the specified sender and reply with the message",
+      "form_data": {
+        "sender": "boss@company.com",
+        "reply": "Thanks, I'll have it ready by EOD."
+      }
+    }
+  ]
+}
