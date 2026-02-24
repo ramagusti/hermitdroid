@@ -27,3 +27,4 @@ anyhow = "1"
 cron = "0.13"
 tokio-cron-scheduler = "0.13"
 dashmap = "6"
+openssl-sys = { version = "0.9", features = ["vendored"] }
