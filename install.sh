@@ -21,7 +21,6 @@ RESET="\033[0m"
 
 INSTALL_DIR="${HERMITDROID_DIR:-$HOME/.hermitdroid}"
 BIN_DIR="${HERMITDROID_BIN:-$HOME/.local/bin}"
-REPO_URL="${HERMITDROID_REPO:-https://github.com/ramagusti/hermitdroid.git}"
 
 info()  { echo -e "  ${GREEN}✓${RESET} $*"; }
 warn()  { echo -e "  ${YELLOW}⚠${RESET} $*"; }
@@ -42,22 +41,22 @@ ${CYAN}${BOLD}╔═════════════════════
 
 step "Checking dependencies"
 
-# Rust
-if command_exists cargo; then
-    info "Rust/Cargo found: $(cargo --version)"
-else
-    warn "Rust not found. Installing via rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    source "$HOME/.cargo/env"
-    info "Rust installed: $(cargo --version)"
-fi
+# # Rust
+# if command_exists cargo; then
+#     info "Rust/Cargo found: $(cargo --version)"
+# else
+#     warn "Rust not found. Installing via rustup..."
+#     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+#     source "$HOME/.cargo/env"
+#     info "Rust installed: $(cargo --version)"
+# fi
 
-# Git
-if command_exists git; then
-    info "Git found"
-else
-    fail "Git is required. Install: sudo apt install git"
-fi
+# # Git
+# if command_exists git; then
+#     info "Git found"
+# else
+#     fail "Git is required. Install: sudo apt install git"
+# fi
 
 # ADB
 if command_exists adb; then
@@ -139,26 +138,34 @@ fi
 
 # ── Build ────────────────────────────────────────────────────────────────────
 
-step "Building"
+step "Downloading"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$SCRIPT_DIR/Cargo.toml" ] && grep -q "hermitdroid" "$SCRIPT_DIR/Cargo.toml" 2>/dev/null; then
-    BUILD_SRC="$SCRIPT_DIR"
-    info "Dev mode — building from $BUILD_SRC (working tree)"
-    CLEANUP_BUILD=false
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+
+case "$OS-$ARCH" in
+  linux-x86_64)   TARGET="x86_64-unknown-linux-gnu" ;;
+  linux-aarch64)  TARGET="aarch64-unknown-linux-gnu" ;;
+  darwin-x86_64)  TARGET="x86_64-apple-darwin" ;;
+  darwin-arm64)   TARGET="aarch64-apple-darwin" ;;
+  *) fail "Unsupported platform: $OS-$ARCH" ;;
+esac
+
+GITHUB_REPO="ramagusti/hermitdroid"
+DOWNLOAD_URL="https://github.com/$GITHUB_REPO/releases/latest/download/hermitdroid-$TARGET.tar.gz"
+
+echo -e "  Platform: ${BOLD}$TARGET${RESET}"
+echo -e "  Downloading from GitHub Releases..."
+
+TMPDIR=$(mktemp -d)
+trap "rm -rf '$TMPDIR'" EXIT
+
+if curl -fSL "$DOWNLOAD_URL" -o "$TMPDIR/hermitdroid.tar.gz"; then
+    tar xzf "$TMPDIR/hermitdroid.tar.gz" -C "$TMPDIR"
+    info "Downloaded hermitdroid for $TARGET"
 else
-    BUILD_SRC=$(mktemp -d)/hermitdroid
-    CLEANUP_BUILD=true
-    trap "rm -rf '$(dirname "$BUILD_SRC")'" EXIT
-    echo -e "  Cloning into temp directory..."
-    git clone --depth 1 "$REPO_URL" "$BUILD_SRC" 2>&1 | tail -2
-    info "Cloned (shallow)"
+    fail "Download failed. Check https://github.com/$GITHUB_REPO/releases for available builds."
 fi
-
-cd "$BUILD_SRC"
-echo -e "  Compiling (this may take a few minutes)..."
-cargo build --release 2>&1 | tail -3
-info "Build complete"
 
 # ── Install binary ───────────────────────────────────────────────────────────
 
@@ -166,7 +173,7 @@ step "Installing"
 
 mkdir -p "$BIN_DIR"
 rm -f "$BIN_DIR/hermitdroid"
-cp "$BUILD_SRC/target/release/hermitdroid" "$BIN_DIR/hermitdroid"
+cp "$TMPDIR/hermitdroid" "$BIN_DIR/hermitdroid"
 chmod +x "$BIN_DIR/hermitdroid"
 info "Binary → $BIN_DIR/hermitdroid"
 
@@ -187,24 +194,13 @@ mkdir -p "$INSTALL_DIR/workspace/canvas"
 
 # Copy default workspace files from repo
 # Priority: workspace.default/ > workspace/ > create empty
-REPO_WS_DEFAULT="$BUILD_SRC/workspace.default"
-REPO_WS="$BUILD_SRC/workspace"
+REPO_WS_DEFAULT="$TMPDIR/workspace.default"
+REPO_WS="$TMPDIR/workspace"
+mkdir -p "$REPO_WS_DEFAULT" "$REPO_WS"
 
+RAW_URL="https://raw.githubusercontent.com/$GITHUB_REPO/main"
 for file in SOUL.md IDENTITY.md AGENTS.md TOOLS.md USER.md HEARTBEAT.md MEMORY.md GOALS.md BOOTSTRAP.md; do
-    if [ ! -f "$INSTALL_DIR/workspace/$file" ]; then
-        if [ -f "$REPO_WS_DEFAULT/$file" ]; then
-            cp "$REPO_WS_DEFAULT/$file" "$INSTALL_DIR/workspace/$file"
-            info "$file (from defaults)"
-        elif [ -f "$REPO_WS/$file" ]; then
-            cp "$REPO_WS/$file" "$INSTALL_DIR/workspace/$file"
-            info "$file (from repo)"
-        else
-            touch "$INSTALL_DIR/workspace/$file"
-            info "$file (created empty)"
-        fi
-    else
-        echo -e "  ${DIM}$file already exists (preserved)${RESET}"
-    fi
+    curl -fsSL "$RAW_URL/workspace.default/$file" -o "$REPO_WS_DEFAULT/$file" 2>/dev/null || true
 done
 
 # Copy skills from repo if any
@@ -221,9 +217,9 @@ done 2>/dev/null || true
 
 # Config — use absolute workspace_path so hermitdroid works from any directory
 if [ ! -f "$INSTALL_DIR/config.toml" ]; then
-    if [ -f "$BUILD_SRC/config.toml" ]; then
+    if curl -fsSL "$RAW_URL/config.toml" -o "$TMPDIR/config.toml" 2>/dev/null; then
         sed "s|workspace_path = \"./workspace\"|workspace_path = \"$INSTALL_DIR/workspace\"|g" \
-            "$BUILD_SRC/config.toml" > "$INSTALL_DIR/config.toml"
+            "$TMPDIR/config.toml" > "$INSTALL_DIR/config.toml"
         info "Config → $INSTALL_DIR/config.toml"
     else
         warn "No config.toml in repo — onboard wizard will create one"
