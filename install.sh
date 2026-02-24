@@ -143,45 +143,83 @@ step "Downloading"
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 
-case "$OS-$ARCH" in
-  linux-x86_64)   TARGET="x86_64-unknown-linux-gnu" ;;
-  linux-aarch64)  TARGET="aarch64-unknown-linux-gnu" ;;
-  darwin-x86_64)  TARGET="x86_64-apple-darwin" ;;
-  darwin-arm64)   TARGET="aarch64-apple-darwin" ;;
-  *) fail "Unsupported platform: $OS-$ARCH" ;;
+GITHUB_REPO="ramagusti/hermitdroid"
+TMPDIR=$(mktemp -d)
+trap "rm -rf '$TMPDIR'" EXIT
+
+pick_linux_target() {
+    local arch="$1"
+    local arch_rust
+
+    case "$arch" in
+        x86_64)  arch_rust="x86_64" ;;
+        aarch64) arch_rust="aarch64" ;;
+        *) fail "Unsupported architecture: $arch" ;;
+    esac
+
+    # Check glibc version — if >= 2.35, use gnu (faster); otherwise use musl (static)
+    local glibc_ver=""
+    if command_exists ldd; then
+        glibc_ver=$(ldd --version 2>&1 | head -1 | grep -oP '\d+\.\d+$' || true)
+    fi
+
+    if [ -n "$glibc_ver" ]; then
+        local major minor
+        major=$(echo "$glibc_ver" | cut -d. -f1)
+        minor=$(echo "$glibc_ver" | cut -d. -f2)
+
+        if [ "$major" -gt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -ge 35 ]; }; then
+            echo "${arch_rust}-unknown-linux-gnu"
+            return
+        fi
+    fi
+
+    # Old glibc or can't detect — use musl (static, works everywhere)
+    echo "${arch_rust}-unknown-linux-musl"
+}
+
+case "$OS" in
+    linux)
+        TARGET=$(pick_linux_target "$ARCH")
+        ;;
+    darwin)
+        case "$ARCH" in
+            x86_64)  TARGET="x86_64-apple-darwin" ;;
+            arm64)   TARGET="aarch64-apple-darwin" ;;
+            *) fail "Unsupported macOS architecture: $ARCH" ;;
+        esac
+        ;;
+    *)
+        fail "Unsupported OS: $OS"
+        ;;
 esac
 
-GITHUB_REPO="ramagusti/hermitdroid"
 DOWNLOAD_URL="https://github.com/$GITHUB_REPO/releases/latest/download/hermitdroid-$TARGET.tar.gz"
 
 echo -e "  Platform: ${BOLD}$TARGET${RESET}"
+if [[ "$TARGET" == *musl* ]]; then
+    echo -e "  ${DIM}(static build — compatible with all Linux versions)${RESET}"
+fi
 echo -e "  Downloading from GitHub Releases..."
-
-TMPDIR=$(mktemp -d)
-trap "rm -rf '$TMPDIR'" EXIT
 
 if curl -fSL "$DOWNLOAD_URL" -o "$TMPDIR/hermitdroid.tar.gz"; then
     tar xzf "$TMPDIR/hermitdroid.tar.gz" -C "$TMPDIR"
     info "Downloaded hermitdroid for $TARGET"
 else
-    fail "Download failed. Check https://github.com/$GITHUB_REPO/releases for available builds."
-fi
-
-# ── Install binary ───────────────────────────────────────────────────────────
-
-step "Installing"
-
-mkdir -p "$BIN_DIR"
-rm -f "$BIN_DIR/hermitdroid"
-cp "$TMPDIR/hermitdroid" "$BIN_DIR/hermitdroid"
-chmod +x "$BIN_DIR/hermitdroid"
-info "Binary → $BIN_DIR/hermitdroid"
-
-if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-    warn "$BIN_DIR is not in your PATH"
-    echo -e "    Add to your shell profile (~/.bashrc, ~/.zshrc):"
-    echo -e "    ${DIM}export PATH=\"$BIN_DIR:\$PATH\"${RESET}"
-    export PATH="$BIN_DIR:$PATH"
+    # If gnu failed, try musl as fallback
+    if [[ "$TARGET" == *gnu* ]]; then
+        FALLBACK_TARGET="${TARGET/gnu/musl}"
+        FALLBACK_URL="https://github.com/$GITHUB_REPO/releases/latest/download/hermitdroid-$FALLBACK_TARGET.tar.gz"
+        warn "gnu build not available, trying static (musl) build..."
+        if curl -fSL "$FALLBACK_URL" -o "$TMPDIR/hermitdroid.tar.gz"; then
+            tar xzf "$TMPDIR/hermitdroid.tar.gz" -C "$TMPDIR"
+            info "Downloaded hermitdroid for $FALLBACK_TARGET (static)"
+        else
+            fail "Download failed. Check https://github.com/$GITHUB_REPO/releases"
+        fi
+    else
+        fail "Download failed. Check https://github.com/$GITHUB_REPO/releases"
+    fi
 fi
 
 # ── Set up ~/.hermitdroid ────────────────────────────────────────────────────
