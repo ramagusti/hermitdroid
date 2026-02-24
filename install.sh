@@ -222,6 +222,23 @@ else
     fi
 fi
 
+# ── Install binary ───────────────────────────────────────────────────────────
+
+step "Installing"
+
+mkdir -p "$BIN_DIR"
+rm -f "$BIN_DIR/hermitdroid"
+cp "$TMPDIR/hermitdroid" "$BIN_DIR/hermitdroid"
+chmod +x "$BIN_DIR/hermitdroid"
+info "Binary → $BIN_DIR/hermitdroid"
+
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    warn "$BIN_DIR is not in your PATH"
+    echo -e "    Add to your shell profile (~/.bashrc, ~/.zshrc):"
+    echo -e "    ${DIM}export PATH=\"$BIN_DIR:\$PATH\"${RESET}"
+    export PATH="$BIN_DIR:$PATH"
+fi
+
 # ── Set up ~/.hermitdroid ────────────────────────────────────────────────────
 
 step "Setting up workspace"
