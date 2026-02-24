@@ -200,7 +200,16 @@ mkdir -p "$REPO_WS_DEFAULT" "$REPO_WS"
 
 RAW_URL="https://raw.githubusercontent.com/$GITHUB_REPO/main"
 for file in SOUL.md IDENTITY.md AGENTS.md TOOLS.md USER.md HEARTBEAT.md MEMORY.md GOALS.md BOOTSTRAP.md; do
-    curl -fsSL "$RAW_URL/workspace.default/$file" -o "$REPO_WS_DEFAULT/$file" 2>/dev/null || true
+    if [ ! -f "$INSTALL_DIR/workspace/$file" ]; then
+        if curl -fsSL "$RAW_URL/workspace.default/$file" -o "$INSTALL_DIR/workspace/$file" 2>/dev/null; then
+            info "$file (from repo)"
+        else
+            touch "$INSTALL_DIR/workspace/$file"
+            info "$file (created empty)"
+        fi
+    else
+        echo -e "  ${DIM}$file already exists (preserved)${RESET}"
+    fi
 done
 
 # Copy skills from repo if any
@@ -217,7 +226,7 @@ done 2>/dev/null || true
 
 # Config — use absolute workspace_path so hermitdroid works from any directory
 if [ ! -f "$INSTALL_DIR/config.toml" ]; then
-    if curl -fsSL "$RAW_URL/config.toml" -o "$TMPDIR/config.toml" 2>/dev/null; then
+    if curl -fsSL "$RAW_URL/config.default.toml" -o "$TMPDIR/config.toml" 2>/dev/null; then
         sed "s|workspace_path = \"./workspace\"|workspace_path = \"$INSTALL_DIR/workspace\"|g" \
             "$TMPDIR/config.toml" > "$INSTALL_DIR/config.toml"
         info "Config → $INSTALL_DIR/config.toml"
